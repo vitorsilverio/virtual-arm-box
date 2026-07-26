@@ -1,0 +1,11 @@
+#!/bin/busybox sh
+# init do initramfs de teste do linuxbox (B4.1.5). Roda como PID 1 (rdinit=/init),
+# interpretado pelo binfmt_script do kernel via a shebang acima ("#!/bin/busybox sh" ->
+# kernel reexecuta /bin/busybox com argv0=sh e este script como argumento).
+/bin/busybox --install -s /bin
+mount -t proc none /proc
+mount -t sysfs none /sys
+echo
+echo "linuxbox: initramfs busybox pronta (B4.1.5)."
+echo
+exec /bin/sh
