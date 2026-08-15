@@ -1,29 +1,39 @@
-# linuxbox
+# virtual-arm-box
 
-Hospedeiro "full-system" para o arm-jitter (tarefa B4.1.5 do épico B4.1/MMU-softmmu,
-RFC-SOFTMMU): emula uma placa `versatilepb`-like (`-M versatilepb` do QEMU) o suficiente para
-levar um kernel Linux real até um **shell `busybox` interativo** — alcançado, nos backends
-interpretado E ASM/JIT (`VersatilePbBootTest`).
+Emulador de **máquina ARM completa** (CPU + MMU + periféricos + boot) sobre a biblioteca
+`arm-jitter`; irmão do `armbox` (user-mode) e dos emuladores `gbaemu`/`ndsemu`.
 
-Periféricos: RAM 128MiB (`PagedAddressSpace`), PL011 UART0 (console), SP804 (dois
-temporizadores duplos), PL190 (VIC primário). MMU via `TranslatingAddressSpace` +
+Periféricos da `versatilepb`: RAM 128MiB (`PagedAddressSpace`), PL011 UART0 (console), SP804
+(dois temporizadores duplos), PL190 (VIC primário). MMU via `TranslatingAddressSpace` +
 `Cp15VmsaCoprocessor` do arm-jitter (B4.1.1-B4.1.4).
 
-CPU do guest: **ARM926EJ-S com a VFP9-S opcional presente** (`ArmArchitecture.ARMV5TE` +
-`ArmFeature.VFPV2`, o mesmo que o `-cpu arm926` do QEMU expõe). A RFC pedia ARM1176/ARMv6K; o
-desvio é forçado pelo kernel real disponível e está documentado no Javadoc de
-`VersatilePbMachine` e de `device/VersatileCp15Extras`.
+## Máquinas
+
+| Máquina | `--machine=` | CPU do guest | Estado |
+|---------|--------------|--------------|--------|
+| ARM VersatilePB | `versatilepb` | ARM926EJ-S (ARMv5TE + VFPv2) | ✅ boota Linux real até shell `busybox` interativo (JIT e interpretado) |
+| Raspberry Pi 1 / Zero | `raspi1` | ARM1176JZF-S (ARMv6K + VFPv2) | 🔜 task F3 |
+
+Disco virtual (`raw`/QCOW2) é a task F10 e ainda não existe: hoje a raiz vem de `initramfs`.
 
 ## Rodar
 
 ```
 mvn -o package
-java -cp target/classes:<arm-jitter.jar> dev.vitorsilverio.linuxbox.Main \
-    [--interp|--check] [--cycles=N] testdata/vmlinuz-3.2.0-4-versatile testdata/initramfs.cpio.gz
+java -cp target/classes:<arm-jitter.jar> dev.vitorsilverio.virtualarmbox.Main \
+    --machine=versatilepb [--interp|--check] [--cycles=N] \
+    testdata/vmlinuz-3.2.0-4-versatile testdata/initramfs.cpio.gz
 ```
 
 O `stdin` do host é drenado (sem bloquear) para o UART0 do guest, então o shell responde a
-comandos digitados. Sem argumento de backend o default é JIT.
+comandos digitados. Sem argumento de backend o default é JIT. Sem `--machine=`, o default é
+`versatilepb`.
+
+## Não é objetivo
+
+Esta é uma máquina **ARM**; rodar Windows/Android exige a máquina AArch64 `virt` com UEFI, que
+depende de B6.6.6 fechar no arm-jitter. **macOS não é alvo** (Apple Silicon não é documentado e
+o boot é acorrentado ao hardware da Apple). Ver `ROADMAP.md`.
 
 ## Ver também
 

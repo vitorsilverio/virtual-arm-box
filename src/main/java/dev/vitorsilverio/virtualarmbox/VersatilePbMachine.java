@@ -1,4 +1,4 @@
-package dev.vitorsilverio.linuxbox;
+package dev.vitorsilverio.virtualarmbox;
 
 import dev.vitorsilverio.armjitter.arch.ArmArchitecture;
 import dev.vitorsilverio.armjitter.arch.ArmFeature;
@@ -13,12 +13,12 @@ import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.armjitter.memory.mmu.Cp15VmsaCoprocessor;
 import dev.vitorsilverio.armjitter.memory.mmu.TranslatingAddressSpace;
 import dev.vitorsilverio.armjitter.swi.SwiDispatcher;
-import dev.vitorsilverio.linuxbox.boot.AtagsBuilder;
-import dev.vitorsilverio.linuxbox.device.OpenBus;
-import dev.vitorsilverio.linuxbox.device.Pl011Uart;
-import dev.vitorsilverio.linuxbox.device.Pl190Vic;
-import dev.vitorsilverio.linuxbox.device.Sp804DualTimer;
-import dev.vitorsilverio.linuxbox.device.VersatileCp15Extras;
+import dev.vitorsilverio.virtualarmbox.boot.AtagsBuilder;
+import dev.vitorsilverio.virtualarmbox.device.OpenBus;
+import dev.vitorsilverio.virtualarmbox.device.Pl011Uart;
+import dev.vitorsilverio.virtualarmbox.device.Pl190Vic;
+import dev.vitorsilverio.virtualarmbox.device.Sp804DualTimer;
+import dev.vitorsilverio.virtualarmbox.device.VersatileCp15Extras;
 
 import java.io.OutputStream;
 
@@ -37,7 +37,7 @@ import java.io.OutputStream;
 /// `irqAsserted()`, consultado por sondagem a cada fatia de {@link #RUN_SLICE_BLOCKS} blocos
 /// do laço principal ({@link #runSlice}) — o mesmo padrão de "fatia" que o armbox usa, mas
 /// com hardware real a atender entre elas (o armbox é user-mode puro, sem isso).
-public final class VersatilePbMachine {
+public final class VersatilePbMachine implements Machine {
     /// `machine->ram_size` — 128MiB, o tamanho pedido pela task (versatilepb aceita até 256MiB;
     /// `versatile_init` do QEMU recusa acima disso: "memory cannot overlap with devices").
     public static final int RAM_SIZE_BYTES = 128 * 1024 * 1024;
@@ -210,12 +210,14 @@ public final class VersatilePbMachine {
     }
 
     /// Entrega um byte de teclado (host) ao UART0.
+    @Override
     public void typeByte(int value) {
         uart.receiveByte(value);
     }
 
     /// Executa uma fatia do laço principal ({@link #RUN_SLICE_BLOCKS} blocos), avança os
     /// temporizadores pelos ciclos consumidos e reavalia a linha de IRQ agregada do VIC.
+    @Override
     public void runSlice() {
         core.runBlocks(runtime, RUN_SLICE_BLOCKS);
         long cycles = core.cycles();
@@ -232,12 +234,14 @@ public final class VersatilePbMachine {
     }
 
     /// Core interno (para inspeção/depuração e para o `GdbServer` do arm-jitter).
+    @Override
     public ArmCore core() {
         return core;
     }
 
     /// `JitRuntime` interno (para depuração fina — ex.: `core().runBlock(runtime())` em passos
     /// menores que {@link #RUN_SLICE_BLOCKS}).
+    @Override
     public JitRuntime runtime() {
         return runtime;
     }

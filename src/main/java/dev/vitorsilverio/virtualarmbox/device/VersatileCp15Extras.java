@@ -1,4 +1,4 @@
-package dev.vitorsilverio.linuxbox.device;
+package dev.vitorsilverio.virtualarmbox.device;
 
 import dev.vitorsilverio.armjitter.coprocessor.CoprocessorBus;
 import dev.vitorsilverio.armjitter.memory.mmu.Cp15VmsaCoprocessor;

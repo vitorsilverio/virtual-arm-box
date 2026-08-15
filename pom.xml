@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>dev.vitorsilverio</groupId>
-    <artifactId>linuxbox</artifactId>
+    <artifactId>virtual-arm-box</artifactId>
     <version>1.0-SNAPSHOT</version>
 
     <licenses>
@@ -50,7 +50,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>dev.vitorsilverio.linuxbox.Main</mainClass>
+                            <mainClass>dev.vitorsilverio.virtualarmbox.Main</mainClass>
                         </manifest>
                     </archive>
                 </configuration>

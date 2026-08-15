@@ -1,7 +1,7 @@
-package dev.vitorsilverio.linuxbox.boot;
+package dev.vitorsilverio.virtualarmbox.boot;
 
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
-import dev.vitorsilverio.linuxbox.device.OpenBus;
+import dev.vitorsilverio.virtualarmbox.device.OpenBus;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;

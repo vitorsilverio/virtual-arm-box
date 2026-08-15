@@ -1,4 +1,4 @@
-package dev.vitorsilverio.linuxbox.boot;
+package dev.vitorsilverio.virtualarmbox.boot;
 
 import dev.vitorsilverio.armjitter.memory.AddressSpace;
 

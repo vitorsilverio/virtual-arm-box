@@ -1,4 +1,4 @@
-package dev.vitorsilverio.linuxbox;
+package dev.vitorsilverio.virtualarmbox;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;

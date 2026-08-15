@@ -1,4 +1,4 @@
-package dev.vitorsilverio.linuxbox.device;
+package dev.vitorsilverio.virtualarmbox.device;
 
 import org.junit.jupiter.api.Test;
 

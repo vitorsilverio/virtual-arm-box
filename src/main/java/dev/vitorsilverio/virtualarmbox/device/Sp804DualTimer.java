@@ -1,4 +1,4 @@
-package dev.vitorsilverio.linuxbox.device;
+package dev.vitorsilverio.virtualarmbox.device;
 
 import dev.vitorsilverio.armjitter.memory.AddressSpace;
 import dev.vitorsilverio.armjitter.memory.MemoryAccessType;
