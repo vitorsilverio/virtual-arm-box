@@ -1,0 +1,45 @@
+name: Bug
+description: Comportamento errado observável
+labels: [bug]
+body:
+  - type: input
+    id: resumo
+    attributes:
+      label: Resumo
+    validations:
+      required: true
+  - type: textarea
+    id: reproduzir
+    attributes:
+      label: Como reproduzir
+      description: Inclui ROM/binário e backend usados
+    validations:
+      required: true
+  - type: textarea
+    id: esperado
+    attributes:
+      label: Comportamento esperado
+    validations:
+      required: true
+  - type: textarea
+    id: evidencia
+    attributes:
+      label: Evidência
+      description: Log, hash de commit, print, savestate
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - JIT/ASM
+        - INTERPRETED
+        - ambos
+        - não sei
+  - type: dropdown
+    id: regressao
+    attributes:
+      label: Já era assim antes?
+      options:
+        - regressão nova
+        - sempre foi assim
+        - não sei

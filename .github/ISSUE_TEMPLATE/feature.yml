@@ -1,0 +1,21 @@
+name: Feature
+description: Pedido novo
+labels: [feature]
+body:
+  - type: textarea
+    id: o-que
+    attributes:
+      label: O que
+    validations:
+      required: true
+  - type: textarea
+    id: por-que
+    attributes:
+      label: Por quê
+    validations:
+      required: true
+  - type: textarea
+    id: referencia
+    attributes:
+      label: Referência
+      description: Como outro emulador/hardware real faz
