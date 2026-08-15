@@ -4,73 +4,119 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// Aceite PARCIAL da task B4.1.5 (ver relatório da sessão e `testdata/README.md`): o objetivo
-/// completo era o kernel `testdata/vmlinuz-3.2.0-4-versatile` bootar até um shell `busybox`
-/// interativo nos backends interpretado E ASM/JIT, com `--check` sobrevivendo ao boot inteiro
-/// (G1). **Isso NÃO foi alcançado nesta sessão** — o boot trava mais cedo, numa falta de
-/// tradução recursiva ao redor da página de vetores de exceção (`0xffff0000`, vetores altos)
-/// logo após o kernel saltar para código em endereço virtual pós-MMU (`0xc0...`), causa raiz
-/// ainda não isolada (não é falta de decode conhecida — `PLD`/`PRELOAD_HINTS`, o único gap real
-/// de decode encontrado e corrigido nesta sessão, já não é mais o bloqueio).
+/// Aceite da task B4.1.5: o kernel Linux REAL de `testdata/vmlinuz-3.2.0-4-versatile` boota neste
+/// hospedeiro até um **shell `busybox` interativo**, nos backends interpretado E ASM/JIT — e o
+/// shell responde de verdade a um comando digitado (`echo`), não só imprime o prompt.
 ///
-/// Este teste verifica o marco real e verificável que FOI alcançado antes desse bloqueio: o
-/// zImage descomprime e o processador salta para o kernel descomprimido (mensagem
-/// `"Uncompressing Linux... done, booting the kernel."`, impressa pelo próprio stub de
-/// descompressão do zImage real via UART0) — prova que RAM ({@link VersatilePbMachine},
-/// `PagedAddressSpace`), PL011, MMU (`TranslatingAddressSpace`/`Cp15VmsaCoprocessor`,
-/// B4.1.1-B4.1.4) e o protocolo de boot ATAGs (`AtagsBuilder`) funcionam de ponta a ponta com um
-/// kernel Linux ARM REAL, nos dois backends.
+/// O caminho exercitado de ponta a ponta é o épico B4.1 inteiro: `PagedAddressSpace` (RAM) +
+/// PL011/SP804/PL190 + protocolo de boot ATAGs (`AtagsBuilder`) + MMU real
+/// (`TranslatingAddressSpace`/`Cp15VmsaCoprocessor`, B4.1.1-B4.1.4) com page-walk, aborts precisos
+/// (demand paging e copy-on-write do `fork()` do kernel), TLB de instrução/dados e gerações de
+/// tradução no `BlockCache`.
 ///
-/// **Não usa `--check` aqui**: é ordens de magnitude mais lento (interpretado + ASM em paralelo,
-/// save/restore de estado por bloco) e o boot completo (o único cenário que valeria testar com
-/// `--check`) ainda não é alcançável — descartado deliberadamente até o boot avançar mais, para
-/// não deixar a suíte de testes com um teste de minutos sem um marco novo para provar.
+/// **Não usa `--check` aqui**: rodar interpretado e ASM em paralelo com save/restore de estado por
+/// bloco é ordens de magnitude mais lento que os dois backends já cobertos, e o boot completo leva
+/// minutos mesmo sem isso — descartado deliberadamente para não deixar a suíte com um teste de
+/// dezenas de minutos que não prova nada além do que estes dois já provam separadamente.
 class VersatilePbBootTest {
     private static final Path TESTDATA = Path.of("testdata");
     private static final String CMDLINE = "console=ttyAMA0 root=/dev/ram rdinit=/init";
-    /// Fatias suficientes para atravessar a descompressão do zImage (medido experimentalmente
-    /// nesta sessão: a mensagem aparece por volta da fatia 360554 em ambos os backends), com
-    /// folga generosa.
-    private static final int MAX_SLICES = 600_000;
-    private static final String DECOMPRESSION_DONE_MARKER = "done, booting the kernel.";
+    /// Fatias suficientes para atravessar descompressão + boot do kernel + `busybox --install` +
+    /// shell, com folga generosa (o laço para assim que o marco aparece).
+    private static final int MAX_SLICES = 8_000_000;
+    /// Prompt do `sh` do busybox rodando como root.
+    private static final String SHELL_PROMPT = "/ #";
+    /// Comando digitado no shell. As aspas no meio existem de propósito: a linha ECOADA pelo tty
+    /// contém `LINUX"BOX-SHELL-OK"`, e só a SAÍDA do comando contém `LINUXBOX-SHELL-OK` sem elas —
+    /// sem isso o teste passaria só com o eco do terminal, sem o shell ter executado nada.
+    private static final String SHELL_COMMAND = "echo LINUX\"BOX-SHELL-OK\"\n";
+    private static final String SHELL_COMMAND_OUTPUT = "LINUXBOX-SHELL-OK";
+    /// De quantas em quantas fatias o console é reexaminado (converter o buffer inteiro a cada
+    /// fatia domina o tempo do teste).
+    private static final int CONSOLE_POLL_INTERVAL = 2_000;
+    /// Fatias rodadas entre dois bytes digitados — ver {@link #type}.
+    private static final int SLICES_PER_TYPED_BYTE = 200;
 
     @Test
-    @Timeout(value = 5, unit = TimeUnit.MINUTES)
-    void decompressesKernelAndJumpsToItInterpreted() throws Exception {
-        String console = bootAndCapture(VersatilePbMachine.Backend.INTERPRETED);
-        assertReachedDecompressionCheckpoint(console);
+    @Timeout(value = 30, unit = TimeUnit.MINUTES)
+    void bootsToInteractiveBusyboxShellInterpreted() throws Exception {
+        assertReachesInteractiveShell(VersatilePbMachine.Backend.INTERPRETED);
     }
 
     @Test
-    @Timeout(value = 5, unit = TimeUnit.MINUTES)
-    void decompressesKernelAndJumpsToItJit() throws Exception {
-        String console = bootAndCapture(VersatilePbMachine.Backend.JIT);
-        assertReachedDecompressionCheckpoint(console);
+    @Timeout(value = 30, unit = TimeUnit.MINUTES)
+    void bootsToInteractiveBusyboxShellJit() throws Exception {
+        assertReachesInteractiveShell(VersatilePbMachine.Backend.JIT);
     }
 
-    private static void assertReachedDecompressionCheckpoint(String console) {
-        assertTrue(console.contains(DECOMPRESSION_DONE_MARKER),
-                "esperava o zImage terminar de descomprimir e saltar para o kernel, obtive:\n" + console);
-    }
-
-    private static String bootAndCapture(VersatilePbMachine.Backend backend) throws Exception {
+    private static void assertReachesInteractiveShell(VersatilePbMachine.Backend backend) throws Exception {
         byte[] kernel = Files.readAllBytes(TESTDATA.resolve("vmlinuz-3.2.0-4-versatile"));
         byte[] initramfs = Files.readAllBytes(TESTDATA.resolve("initramfs.cpio.gz"));
         ByteArrayOutputStream console = new ByteArrayOutputStream();
         VersatilePbMachine machine = VersatilePbMachine.create(kernel, initramfs, CMDLINE, console, backend);
-        for (int i = 0; i < MAX_SLICES; i++) {
-            machine.runSlice();
-            if (i % 2000 == 0 && console.toString(java.nio.charset.StandardCharsets.US_ASCII)
-                    .contains(DECOMPRESSION_DONE_MARKER)) {
-                break;
+
+        boolean reachedPrompt = runUntil(machine, console, SHELL_PROMPT);
+        assertTrue(reachedPrompt,
+                "esperava o prompt do shell busybox (" + SHELL_PROMPT + "), obtive:\n" + text(console));
+
+        // A contagem de referência sai ANTES de digitar: `type` já roda fatias, e a resposta pode
+        // aparecer durante a própria digitação (foi o que aconteceu na 1ª versão deste teste, que
+        // reprovava um boot perfeitamente bem-sucedido).
+        int outputsBeforeTyping = occurrences(text(console), SHELL_COMMAND_OUTPUT);
+        type(machine, SHELL_COMMAND);
+        assertTrue(runUntilMoreThan(machine, console, SHELL_COMMAND_OUTPUT, outputsBeforeTyping),
+                "o shell não respondeu ao comando digitado, obtive:\n" + text(console));
+    }
+
+    /// Digita `text` no UART0 no ritmo de um byte por bloco de fatias. **Não dá para empurrar a
+    /// linha inteira de uma vez**: o FIFO de recepção do PL011 tem 16 posições (`hw/char/pl011.c`)
+    /// e hardware real DESCARTA o excedente — despejar 25 bytes de uma vez faz o guest receber só
+    /// os 16 primeiros, sem o `\n` (foi exatamente o que aconteceu na primeira versão deste teste).
+    private static void type(VersatilePbMachine machine, String text) {
+        for (byte typed : text.getBytes(StandardCharsets.US_ASCII)) {
+            machine.typeByte(typed & 0xFF);
+            for (int slice = 0; slice < SLICES_PER_TYPED_BYTE; slice++) {
+                machine.runSlice();
             }
         }
-        return console.toString(java.nio.charset.StandardCharsets.US_ASCII);
+    }
+
+    /// Roda fatias até `marker` aparecer no console MAIS vezes do que já aparecia na entrada
+    /// (o prompt reaparece a cada comando, então "conter" não basta).
+    private static boolean runUntil(VersatilePbMachine machine, ByteArrayOutputStream console, String marker) {
+        return runUntilMoreThan(machine, console, marker, occurrences(text(console), marker));
+    }
+
+    private static boolean runUntilMoreThan(VersatilePbMachine machine, ByteArrayOutputStream console,
+                                            String marker, int before) {
+        if (occurrences(text(console), marker) > before) {
+            return true;
+        }
+        for (int slice = 0; slice < MAX_SLICES; slice++) {
+            machine.runSlice();
+            if (slice % CONSOLE_POLL_INTERVAL == 0 && occurrences(text(console), marker) > before) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int occurrences(String console, String marker) {
+        int count = 0;
+        for (int at = console.indexOf(marker); at >= 0; at = console.indexOf(marker, at + marker.length())) {
+            count++;
+        }
+        return count;
+    }
+
+    private static String text(ByteArrayOutputStream console) {
+        return console.toString(StandardCharsets.US_ASCII);
     }
 }

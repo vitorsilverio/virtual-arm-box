@@ -1,9 +1,12 @@
 package dev.vitorsilverio.linuxbox;
 
 import dev.vitorsilverio.armjitter.arch.ArmArchitecture;
+import dev.vitorsilverio.armjitter.arch.ArmFeature;
 import dev.vitorsilverio.armjitter.core.ArmCore;
 import dev.vitorsilverio.armjitter.core.CpuMode;
+import dev.vitorsilverio.armjitter.decoder.CoprocessorDecoder;
 import dev.vitorsilverio.armjitter.decoder.InstructionSet;
+import dev.vitorsilverio.armjitter.decoder.VfpDecoder;
 import dev.vitorsilverio.armjitter.jit.JitRuntime;
 import dev.vitorsilverio.armjitter.jit.JitRuntimeFactory;
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
@@ -79,6 +82,36 @@ public final class VersatilePbMachine {
     private static final int REGISTER_R1 = 1;
     private static final int REGISTER_R2 = 2;
 
+    /// Preset do core do guest: **ARM926EJ-S com a VFP9-S opcional presente** — a mesma
+    /// configuração que o `-cpu arm926` do QEMU expõe (`arm926_initfn` liga `ARM_FEATURE_VFP`).
+    ///
+    /// A RFC-SOFTMMU decisão 2 pedia ARM1176/ARMv6K, mas o kernel REAL disponível
+    /// (`testdata/vmlinuz-3.2.0-4-versatile`) só tem `proc-info` ARMv5 compilado — ver Javadoc de
+    /// {@link VersatileCp15Extras} para o desvio completo. Daí `ARMV5TE` como base.
+    ///
+    /// **Por que `VFPV2` em cima da base** (achado real de B4.1.5, sessão 2): o `busybox-armv5l`
+    /// de `testdata/` contém prológos VFP reais (`VPUSH {d8-d14}`, `0xED2D8B0E`), não gateados por
+    /// `HWCAP_VFP`. Sem esta feature o PID 1 recebe `SIGILL` na primeira função que os usa e o
+    /// kernel morre em `Kernel panic - not syncing: Attempted to kill init!`. Não é um desvio de
+    /// fidelidade: a VFP9-S é opcional no ARM926EJ-S real, e é justamente a variante COM VFP que o
+    /// QEMU (o oráculo de periféricos desta task) modela.
+    ///
+    /// O kernel continua reportando `VFP support v0.3: not present`, porque a sondagem dele lê
+    /// `FPSID` via `MRC p10,7,...` e o `VfpDecoder` do arm-jitter só decodifica `FPSCR`
+    /// (`FPSID`/`FPEXC`/`MVFR*` estão explicitamente fora de escopo lá). A consequência prática é
+    /// só o `HWCAP_VFP` ficar zerado no `auxv` — as instruções VFP em si executam, porque num
+    /// ARMv5 não há `CPACR` gateando CP10/CP11 (só `FPEXC.EN`, que também não é modelado).
+    private static final ArmArchitecture ARM926EJS_VFP_FEATURES =
+            ArmArchitecture.extending(ArmArchitecture.ARMV5TE, "ARM926EJ-S+VFP9-S", ArmFeature.VFPV2);
+
+    /// {@link #ARM926EJS_VFP_FEATURES} com os decoders plugados. A ordem espelha
+    /// `ArmArchitecture.ARM11_MPCORE`: `VfpDecoder` ANTES de `CoprocessorDecoder`, senão o decoder
+    /// genérico de coprocessador captura os encodings de CP10/CP11 antes da VFP vê-los.
+    private static final ArmArchitecture ARM926EJS_VFP = ARM926EJS_VFP_FEATURES
+            .withDecoderExtensions(java.util.List.of(
+                    new VfpDecoder(ARM926EJS_VFP_FEATURES),
+                    new CoprocessorDecoder()));
+
     /// Backend de execução do CPU core (mesmo enum conceitual do armbox, sem o TRUFFLE desta
     /// vez — fora do "Inclui" da task).
     public enum Backend {
@@ -132,7 +165,7 @@ public final class VersatilePbMachine {
         // (testdata/vmlinuz-3.2.0-4-versatile, sem toolchain para compilar um próprio) só tem
         // proc-info para ARMv5 (ARM926EJ-S) compilado — ver Javadoc de VersatileCp15Extras para o
         // desvio completo, documentado também em testdata/README.md.
-        ArmArchitecture architecture = ArmArchitecture.ARMV5TE;
+        ArmArchitecture architecture = ARM926EJS_VFP;
         JitRuntime runtime = switch (backend) {
             case JIT -> JitRuntimeFactory.armThumb(BLOCK_CACHE_ENTRIES, HOT_THRESHOLD, architecture);
             case INTERPRETED ->
@@ -148,6 +181,9 @@ public final class VersatilePbMachine {
         // bug do B4.1.2 (a RFC-SOFTMMU nunca pediu CRn=0) nem do desvio ARMv5 vs. ARMv6K.
         core.setCoprocessorBus(new VersatileCp15Extras(cp15));
         core.setMemoryAbortListener(cp15);
+        // Terceiro gancho do CP15 (B4.1.5): modo privilegiado vs. usuário para os bits AP da
+        // tabela de páginas. Sem ele o copy-on-write do fork() do Linux nunca falta.
+        core.setModeChangeListener(cp15);
 
         loadBytes(physical, KERNEL_LOAD_ADDR, kernelZImage);
         loadBytes(physical, INITRD_LOAD_ADDR, initramfs);
