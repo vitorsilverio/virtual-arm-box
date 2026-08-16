@@ -226,6 +226,72 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// (nenhum arquivo de produção tocado nesta sessão — só o harness temporário, removido); M1/M2/M3
 /// continuam no mesmo estado desta e da sessão anterior.
 ///
+/// **Sessão de correção da tempestade de IRQ (2026-08-16) — causa raiz ISOLADA E CORRIGIDA (bug
+/// real do `arm-jitter`), M2 ainda NÃO fecha (bloqueio novo e diferente revelado logo depois)**:
+///
+/// Seguindo o próximo passo recomendado acima, um trace instrução-a-instrução via
+/// {@link dev.vitorsilverio.armjitter.core.ArmCore#step()} — com o detector de "primeira entrada em
+/// `CpuMode.IRQ`" CORRIGIDO para exigir `pc == vetor exato` (não só `mode()==IRQ`; a primeira
+/// tentativa capturava por engano o `cpu_init()` do kernel fazendo `MSR CPSR_c` explícito por
+/// IRQ/ABT/UND/FIQ só para programar o SP de cada modo, nada a ver com uma interrupção de
+/// hardware) — capturou a entrada REAL no vetor `0xffff0018` → `vector_irq` → `__irq_svc` →
+/// `irq_handler`/`handle_arch_irq`. Instrumentação adicional (temporária, direto em
+/// `Bcm2835ArmControlBlock#read32`, removida antes do commit) provou que o driver LÊ
+/// `IRQ_PENDING_BASIC` e recebe `0x100` corretamente na PRIMEIRA leitura — mas as 3 leituras
+/// SEGUINTES, em `addr+1`/`addr+2`/`addr+3` (endereços NÃO alinhados), caem no `default -> 0` do
+/// {@link dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Ic} (offsets desconhecidos).
+///
+/// **Causa raiz real**: `IrExecutionSupport`/`AsmRuntimeHelpers` do `arm-jitter`
+/// (`readWordForLoad`/`writeWordForStore` e os equivalentes de halfword) decompunham TODO
+/// `LDR`/`STR` não-PC sob `ArmFeature.UNALIGNED_ACCESS` (ligada em `ARM11_MPCORE`/ARMv6K+) em 4 (ou
+/// 2) chamadas independentes de `AddressSpace#read8`/`write8` — MESMO quando o endereço já era
+/// múltiplo de 4 (ou 2). Hardware ARMv6+ real faz uma ÚNICA transação de barramento para um acesso
+/// JÁ ALINHADO (só o caso GENUINAMENTE desalinhado precisa da composição byte a byte, ARM DDI
+/// 0406C A3.2.1); o código antigo aplicava o caminho "atravessado" sempre, então um `LDR` alinhado
+/// a `IRQ_PENDING_BASIC` (`0x2000B200`) virava `read8(...200)|read8(...201)&lt;&lt;8|
+/// read8(...202)&lt;&lt;16|read8(...203)&lt;&lt;24` — o byte 0 batia (`0x00`, correto), mas os 3
+/// bytes seguintes caíam no fallback "offset desconhecido" de QUALQUER periférico deste
+/// repositório (nenhum reimplementa "byte N da word alinhada" em `read8`/`write8` — nunca
+/// precisaram, pois nenhum consumidor anterior exercitava um sistema MMIO real sob um preset com
+/// `UNALIGNED_ACCESS`), reconstruindo `0x00000000` em vez do `0x00000100` real. O driver do kernel
+/// (`irq-bcm2835.c`, `get_next_armctrl_hwirq`) via sempre "nada pendente" mesmo com o bit certo
+/// armado no periférico → `bcm2835_handle_irq()` nunca despachava → handler do timer nunca fazia
+/// `ack`/rearme → nível ficava preso "pendente" → CPU reentrava em `CpuMode.IRQ` assim que
+/// `CPSR.I` era reabilitado — exatamente a "tempestade de IRQ" das duas sessões anteriores.
+///
+/// **Corrigido no `arm-jitter`** (`IrExecutionSupport.java` e `AsmRuntimeHelpers.java`, interpretado
+/// E JIT): uma checagem de alinhamento decide entre o caminho legado de transação única (correto
+/// para o caso alinhado) e o caminho atravessado byte a byte (só para endereço genuinamente
+/// desalinhado). 3 testes de regressão novos (2 no interpretador usando um `AddressSpace` de teste
+/// que modela exatamente o padrão real de `Bcm2835Ic` + 1 de equivalência nativa interpretado×JIT).
+/// Sanidade confirmada por `git stash`: revertendo só o fix, os 2 testes do interpretador falham
+/// exatamente como esperado. `mvn -o test` verde no `arm-jitter` (1361 core+truffle) + `mvn -o
+/// install`; G5 revalidado (gbaemu 240 verde, ndsemu 183 verde, armbox 40/41 — a 1 falha é a mesma
+/// pré-existente de `Armv7TortureTest`/VFP, reconfirmada não-regressão via `git stash`).
+///
+/// **Efeito no boot**: com o fix, {@code Bcm2835Machine.Backend.JIT} avança MUITO além do ponto
+/// anterior — `Calibrating delay loop... 3.81 BogoMIPS`, `CPU: Testing write buffer coherency: ok`,
+/// `Setting up static identity map...`, `devtmpfs: initialized` aparecem pela primeira vez (14:43min
+/// de wall-clock, rodada real medida). **M2 ainda NÃO fecha**: um bloqueio NOVO e diferente aparece
+/// logo depois — `Internal error: Oops - undefined instruction` em `vfp_enable+0x8/0x20`, chamado
+/// por `on_each_cpu_cond_mask` ← `vfp_init` ← `do_one_initcall` (durante a inicialização do
+/// subsistema VFP do kernel, com IRQs desligadas) — o processo `init` morre (`Kernel panic - not
+/// syncing: Attempted to kill init!`). Causa provável: alguma instrução de habilitação de VFP (ex.
+/// `VMSR FPEXC,Rt` ligando o bit `EN`) que o `ARM11_MPCORE`/`CoprocessorBus` deste host ainda não
+/// reconhece corretamente — NÃO investigado nesta sessão (fora do orçamento). O backend
+/// `INTERPRETED` não foi levado até o fim: uma rodada real ficou mais de 49 minutos sem terminar (o
+/// `@Timeout(30, MINUTES)` do JUnit, no modo padrão `SAME_THREAD`, não preempte um laço apertado que
+/// nunca checa interrupção — só reporta falha DEPOIS que o método retorna) e foi abortada; como o
+/// JIT já deu um resultado definitivo e muito mais barato, o interpretado fica para quando alguém
+/// precisar — não é um requisito do aceite rodar até o fim fora do orçamento de uma sessão.
+///
+/// **Próximo passo recomendado**: identificar a instrução exata que dispara o `UNDEFINED` em
+/// `vfp_enable()` (provavelmente `VMSR FPEXC,Rt` ou uma leitura de `FPEXC`/`FPSID` via `VMRS`) —
+/// usar o mesmo trace instrução-a-instrução desta sessão, agora mirando o PC exato do Oops
+/// (`vfp_enable+0x8`); comparar contra o oráculo QEMU 8.0.0 (`-M raspi1ap`) para confirmar se é
+/// falta de suporte do coprocessador CP10/CP11 (VFP) nesse ponto do boot ou uma feature de
+/// VFPv2/ARM11 genuinamente não modelada pelo `arm-jitter`.
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
@@ -283,17 +349,19 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("M2 não fecha nesta sessão: o comparador do timer agora É entregue (fix real "
-            + "aplicado, ver Javadoc da classe), mas virou tempestade de IRQ — COMPARE3 congelado, "
-            + "REG_CTRL_STATUS nunca acked, CPU reentra em IRQ continuamente. Causa raiz do lado "
-            + "do handler do kernel/arm-jitter NÃO isolada.")
+    @Disabled("M2 não fecha nesta sessão: a tempestade de IRQ (bug real do arm-jitter, corrigido) "
+            + "está RESOLVIDA — em JIT o boot agora passa de calibrate_delay()/devtmpfs, muito além "
+            + "do ponto anterior — mas um bloqueio NOVO e diferente aparece logo depois: Oops de "
+            + "instrução UNDEFINED em vfp_enable()+0x8 (chamado por on_each_cpu_cond_mask<-vfp_init, "
+            + "com IRQs desligadas), matando o processo `init`. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Interpreted() throws Exception {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M2 não fecha nesta sessão — ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão — mesmo motivo da versão INTERPRETED, ver Javadoc da classe. "
+            + "Rodada real em JIT (14:43min) confirmou o Oops de vfp_enable() como o bloqueio atual.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {
