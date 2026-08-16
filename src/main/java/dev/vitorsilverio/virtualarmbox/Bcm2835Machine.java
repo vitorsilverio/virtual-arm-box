@@ -76,8 +76,20 @@ public final class Bcm2835Machine implements Machine {
     private static final int ARM_CONTROL_BLOCK_BASE = 0x2000_B000;
     private static final int UART0_BASE = 0x2020_1000;
 
-    /// `raspi_platform.h`: fontes GPU do `Bcm2835Ic` usadas por esta task.
+    /// `raspi_platform.h`: fontes GPU do `Bcm2835Ic` usadas por esta task. Os 4 comparadores do
+    /// `Bcm2835SystemTimer` mapeiam 1:1 nas fontes GPU 0-3 (`hw/timer/bcm2835_systmr.c` do QEMU,
+    /// mesma fonte transcrita por aquela classe) — **achado real** (sessão de fechamento do M2):
+    /// o `.dtb` real desta task declara `timer@7e003000: interrupts = <1 0>,<1 1>,<1 2>,<1 3>;`
+    /// com `compatible = "brcm,bcm2835-system-timer"`, o binding exato do driver mainline
+    /// `drivers/clocksource/bcm2835_timer.c`, cujo `DEFAULT_TIMER` é o comparador **3** (0/1 são
+    /// reservados ao firmware VideoCore no hardware real, mesmo sem VideoCore aqui). Só
+    /// encaminhar o comparador 0 (como esta classe fazia antes) nunca entrega o clockevent
+    /// periódico que o kernel arma no comparador 3 — `jiffies` nunca avança e
+    /// `calibrate_delay()` trava para sempre; ver Javadoc de `Raspi1BootTest`.
     private static final int INTERRUPT_TIMER0 = 0;
+    private static final int INTERRUPT_TIMER1 = 1;
+    private static final int INTERRUPT_TIMER2 = 2;
+    private static final int INTERRUPT_TIMER3 = 3;
     private static final int INTERRUPT_UART0 = 57;
     /// `raspi_platform.h`: fonte ARM privada.
     private static final int INTERRUPT_ARM_MAILBOX = 1;
@@ -205,6 +217,9 @@ public final class Bcm2835Machine implements Machine {
         }
         ic.setGpuIrqLine(INTERRUPT_UART0, uart.irqAsserted());
         ic.setGpuIrqLine(INTERRUPT_TIMER0, systemTimer.irqAsserted(0));
+        ic.setGpuIrqLine(INTERRUPT_TIMER1, systemTimer.irqAsserted(1));
+        ic.setGpuIrqLine(INTERRUPT_TIMER2, systemTimer.irqAsserted(2));
+        ic.setGpuIrqLine(INTERRUPT_TIMER3, systemTimer.irqAsserted(3));
         ic.setArmIrqLine(INTERRUPT_ARM_MAILBOX, mailbox.irqAsserted());
         core.setInterruptLine(ic.irqAsserted());
     }

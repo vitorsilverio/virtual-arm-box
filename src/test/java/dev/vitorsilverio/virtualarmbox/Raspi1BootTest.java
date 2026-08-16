@@ -157,6 +157,44 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// staleness de TLB/MMU nem tamanho de RAM (descartados) e não é mais o laço de Oops do FDT
 /// (corrigido). É um bloqueio de entrega/retorno de IRQ periódica, categoricamente novo.
 ///
+/// **Sessão de continuação do M2 (2026-08-16) — causa raiz REFINADA, ainda NÃO fechada**: a
+/// hipótese anterior ("só 1 IRQ de timer entregue em toda a corrida") estava incompleta. Achado
+/// real corrigido nesta sessão: {@link Bcm2835Machine#runSlice()} só encaminhava o comparador
+/// **0** do {@link dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835SystemTimer} para o
+/// {@link dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Ic} — decodificando o `.dtb`
+/// real desta task byte a byte (`timer@7e003000: interrupts = <1 0>,<1 1>,<1 2>,<1 3>;`,
+/// `compatible = "brcm,bcm2835-system-timer"`, exatamente o binding do driver mainline
+/// `drivers/clocksource/bcm2835_timer.c`, cujo `DEFAULT_TIMER` é o comparador **3**), o
+/// clockevent periódico que o kernel arma nunca era entregue. Corrigido: os 4 comparadores agora
+/// são encaminhados 1:1 para as fontes GPU 0-3 (mesma fiação do `hw/timer/bcm2835_systmr.c` do
+/// QEMU, já citada no Javadoc daquela classe).
+///
+/// **O fix acima é necessário mas NÃO suficiente — revelou um bloqueio DIFERENTE**: instrumentação
+/// temporária (removida antes do commit, não faz parte do código entregue) provou, por leitura
+/// direta dos registradores do `Bcm2835SystemTimer`/`Bcm2835Ic` a cada 1M fatias em backend JIT:
+/// `COMPARE3` fica **congelado** no valor inicial (`0x27f4`) por toda a corrida (>250s reais, o
+/// contador livre passa de `0x10767060` para `0xc64beb0a` no mesmo intervalo — bilhões à frente
+/// do "deadline"), o bit 3 de `REG_CTRL_STATUS` fica **permanentemente pendente** (nunca
+/// limpo/`ack`-ado) e o bit 3 de `IRQ_ENABLE_1` nunca é mascarado — e ainda assim a CPU **reentra
+/// em modo IRQ continuamente** (~60.600 vezes por 1M fatias, crescimento linear, contador de
+/// bordas de entrada em `CpuMode.IRQ` medido diretamente). Ou seja: não é mais "nenhuma IRQ
+/// chega" — é uma **tempestade de IRQ**: o handler do kernel para o `hwirq`/`virq` do timer nunca
+/// chega a fazer `ack` (escrita em `REG_CTRL_STATUS`) nem a rearmar (`REG_COMPARE3`), então o
+/// nível fica preso "pendente" e a CPU reentra assim que `CPSR.I` é reabilitado no retorno da IRQ
+/// anterior. Causa raiz exata NÃO isolada nesta sessão — hipóteses concretas para a próxima:
+/// (a) o handler de IRQ do kernel para `hwirq 3`/`virq 27` nunca é de fato despachado (IRQ
+/// tratada como espúria/não mapeada pelo driver `bcm2835-armctrl-ic`, o kernel deveria mascarar
+/// mas talvez essa mascaração também dependa de um registrador/idioma CP15 ainda não emulado);
+/// (b) o retorno de exceção IRQ do `arm-jitter` devolve à instrução certa mas o efeito da
+/// escrita em `REG_CTRL_STATUS`/`REG_COMPARE3` feita pelo handler não está realmente chegando ao
+/// dispositivo (checar se o handler roda em um endereço mapeado corretamente pela
+/// `TranslatingAddressSpace` nesse ponto do boot). Próximo passo recomendado: um trace
+/// instrução-a-instrução (via `ArmCore#step()`/backend INTERPRETED, não `runBlocks`, já que
+/// {@link dev.vitorsilverio.armjitter.core.ArmTraceListener#beforeInstruction} só dispara sob
+/// `step()`) capturando as primeiras dezenas de instruções executadas logo após a PRIMEIRA
+/// entrada em `CpuMode.IRQ`, para confirmar se o código do handler do timer chega a ser
+/// alcançado.
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
@@ -214,10 +252,10 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("M2 não fecha nesta sessão: o laço de Oops de fdt_next_tag FOI RESOLVIDO (2 bugs "
-            + "reais corrigidos, ver Javadoc da classe), mas um bloqueio NOVO e diferente apareceu "
-            + "logo depois — calibrate_delay() nunca termina (só 1 IRQ de timer entregue em toda a "
-            + "corrida, jiffies para de avançar). Causa raiz NÃO isolada.")
+    @Disabled("M2 não fecha nesta sessão: o comparador do timer agora É entregue (fix real "
+            + "aplicado, ver Javadoc da classe), mas virou tempestade de IRQ — COMPARE3 congelado, "
+            + "REG_CTRL_STATUS nunca acked, CPU reentra em IRQ continuamente. Causa raiz do lado "
+            + "do handler do kernel/arm-jitter NÃO isolada.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Interpreted() throws Exception {
