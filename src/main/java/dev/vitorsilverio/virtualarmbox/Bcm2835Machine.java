@@ -11,6 +11,7 @@ import dev.vitorsilverio.armjitter.memory.mmu.Cp15VmsaCoprocessor;
 import dev.vitorsilverio.armjitter.memory.mmu.TranslatingAddressSpace;
 import dev.vitorsilverio.armjitter.swi.SwiDispatcher;
 import dev.vitorsilverio.virtualarmbox.boot.FdtPatcher;
+import dev.vitorsilverio.virtualarmbox.boot.ZImageDecompressor;
 import dev.vitorsilverio.virtualarmbox.device.OpenBus;
 import dev.vitorsilverio.virtualarmbox.device.Pl011Uart;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835ArmControlBlock;
@@ -51,13 +52,18 @@ public final class Bcm2835Machine implements Machine {
     /// `r1` por segurança (kernels com Device Tree o ignoram, mas custa nada estar certo).
     private static final int MACH_TYPE_BCM2708 = 3138;
 
-    /// `KERNEL_LOAD_ADDR` de `hw/arm/boot.c` do QEMU (protocolo direto de boot do QEMU para um
-    /// zImage cru, o mesmo que {@link VersatilePbMachine} usa) — **não** os `0x8000` clássicos do
-    /// bootloader proprietário `start.elf` real: este hospedeiro segue o protocolo do QEMU
-    /// (confirmado batendo o `kernel.img` real neste endereço contra `qemu-system-arm -M
-    /// raspi1ap` como oráculo), não o do firmware VideoCore que este repo explicitamente não tem
-    /// ("Sem `start.elf`/`bootcode.bin`" no "Não inclui" da task).
-    private static final int KERNEL_LOAD_ADDR = RAM_BASE + 0x0001_0000;
+    /// **Sessão 2/3 da F3 — mudança de estratégia**: a sessão 1 carregava o `zImage` cru em
+    /// `RAM_BASE + 0x10000` (`KERNEL_LOAD_ADDR` de `hw/arm/boot.c` do QEMU) e deixava o PRÓPRIO
+    /// stub de descompressão do kernel (`head.S`/`misc.c`, `inflate()` do zlib) rodar dentro do
+    /// guest — correto, mas caro demais (~750 milhões de ciclos medidos, boot nunca terminava
+    /// num orçamento de sessão/CI razoável, ver `Raspi1BootTest`/achado M1 da sessão 1). Esta
+    /// sessão descomprime o `kernel.img` no HOST ({@link ZImageDecompressor}) e carrega a imagem
+    /// JÁ DESCOMPRIMIDA direto no endereço de link que o `stext` do kernel espera —
+    /// {@link ZImageDecompressor#TEXT_OFFSET} (`0x8000`, o `AUTO_ZRELADDR` calculado pelo stub
+    /// real para um zImage carregado bem abaixo de 128MiB, ver Javadoc daquela classe). O
+    /// `KERNEL_LOAD_ADDR` do `zImage` cru não é mais usado para carga nem para o handoff — só o
+    /// endereço descomprimido abaixo.
+    private static final int DECOMPRESSED_KERNEL_LOAD_ADDR = RAM_BASE + ZImageDecompressor.TEXT_OFFSET;
     /// `hw/arm/boot.c`: `MIN(ram_size / 2, 128MiB)` — para 256MiB de RAM, a metade (128MiB).
     private static final int INITRD_LOAD_ADDR = RAM_BASE + 128 * 1024 * 1024;
     /// Alinhamento do DTB depois do initrd (`hw/arm/boot.c`: 4KiB para kernels de 32 bits).
@@ -110,11 +116,14 @@ public final class Bcm2835Machine implements Machine {
         this.mailbox = mailbox;
     }
 
-    /// Monta a máquina completa (RAM + periféricos + MMU + core) e carrega `kernelZImage`/
-    /// `initramfs`/`dtb` na RAM, com `/chosen/bootargs` e `/memory@0/reg` do `dtb` já
-    /// patcheados ({@link FdtPatcher}) para `cmdline` e {@link #RAM_SIZE_BYTES}.
+    /// Monta a máquina completa (RAM + periféricos + MMU + core) e carrega `initramfs`/`dtb` na
+    /// RAM, com `/chosen/bootargs` e `/memory@0/reg` do `dtb` já patcheados ({@link FdtPatcher})
+    /// para `cmdline` e {@link #RAM_SIZE_BYTES}. `kernelZImage` é descomprimido no HOST
+    /// ({@link ZImageDecompressor}, achado da sessão 2/3 da F3) antes de carregar — o guest nunca
+    /// vê o `zImage` comprimido nem roda o `inflate()` caro do stub.
     ///
-    /// @param kernelZImage bytes do zImage (`testdata/raspi1/kernel.img`)
+    /// @param kernelZImage bytes do zImage COMPRIMIDO (`testdata/raspi1/kernel.img`) — esta
+    ///                     fábrica descomprime antes de carregar, ver {@link ZImageDecompressor}
     /// @param initramfs    bytes do initramfs comprimido
     /// @param dtb          bytes do `.dtb` cru (`testdata/raspi1/bcm2708-rpi-b.dtb`)
     /// @param cmdline      linha de comando do kernel — vai para `/chosen/bootargs`, não ATAGs
@@ -152,14 +161,16 @@ public final class Bcm2835Machine implements Machine {
         core.setMemoryAbortListener(cp15);
         core.setModeChangeListener(cp15);
 
-        loadBytes(physical, KERNEL_LOAD_ADDR, kernelZImage);
+        byte[] decompressedKernel = ZImageDecompressor.decompress(kernelZImage);
+        loadBytes(physical, DECOMPRESSED_KERNEL_LOAD_ADDR, decompressedKernel);
         loadBytes(physical, INITRD_LOAD_ADDR, initramfs);
         int dtbAddress = alignUp(INITRD_LOAD_ADDR + initramfs.length, DTB_ALIGNMENT);
 
         byte[] patchedDtb = FdtPatcher.withMemorySize(FdtPatcher.withBootargs(dtb, cmdline), RAM_SIZE_BYTES);
         loadBytes(physical, dtbAddress, patchedDtb);
 
-        core.configureExecutionState(KERNEL_LOAD_ADDR, CpuMode.SUPERVISOR, InstructionSet.ARM, true, true);
+        core.configureExecutionState(
+                DECOMPRESSED_KERNEL_LOAD_ADDR, CpuMode.SUPERVISOR, InstructionSet.ARM, true, true);
         core.setRegister(REGISTER_R0, 0);
         core.setRegister(REGISTER_R1, MACH_TYPE_BCM2708);
         core.setRegister(REGISTER_R2, dtbAddress);
