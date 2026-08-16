@@ -41,24 +41,75 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 ///    não alocado devolve um valor UNKNOWN (aqui `0`), NUNCA lança UNDEFINED — `Bcm2835Cp15Extras`
 ///    agora reivindica o esquema `c0`/`opcode1=0` inteiro em vez de listar `CRm` um a um.
 ///
-/// **M1 AINDA não fecha nesta sessão**: depois dos dois fixes acima, o boot avança
-/// MUITO mais longe (centenas de milhares de ciclos, dezenas de funções de kernel distintas
-/// visitadas por rastreamento instrução-a-instrução) mas esbarra num LIMITE DELIBERADO e já
-/// documentado do `arm-jitter`, não um bug: `IrExecutionSupport.checkLittleEndianData` recusa
-/// (`UnsupportedOperationException`, propositalmente, "falhar ALTO em vez de corromper
-/// silenciosamente") qualquer acesso a dado com `CPSR.E=1` (big-endian/`SETEND BE`) — decisão de
-/// escopo da task `B1.5` do `arm-jitter` (MVP: só little-endian). O kernel ARMv6K real executa
-/// `SETEND`/toca dado big-endian bem cedo no boot (antes de `setup_arch()`/`early_trap_init()`,
-/// o console ainda está vazio quando isso acontece). Implementar acesso de dados big-endian é
-/// arquitetura nova no `arm-jitter` (memória, não só CP15) — fora do escopo cirúrgico desta
-/// task (F3 só corrige "bug real" em commit separado com teste de regressão; suportar BE8 é
-/// funcionalidade nova, não bug). **Fica para decisão do usuário/sessão futura**: priorizar uma
-/// task dedicada de suporte a BE8 no `arm-jitter` antes de M1 poder fechar de verdade.
+/// **Sessão 2/3 — M1 NÃO fechou naquela sessão**: depois dos dois fixes de CP15 acima, o boot
+/// esbarrava num limite deliberado e já documentado do `arm-jitter`: `IrExecutionSupport.
+/// checkLittleEndianData` recusava (`UnsupportedOperationException`, de propósito) qualquer
+/// acesso a dado com `CPSR.E=1` (big-endian/`SETEND BE`) — decisão de escopo MVP da task `B1.5`
+/// do `arm-jitter` (só little-endian). O kernel ARMv6K real executa `SETEND`/toca dado
+/// big-endian bem cedo no boot.
+///
+/// **Sessão 3/3 (2026-08-15) — BLOQUEIO DE BE8 FECHADO pela task `B1.8` do `arm-jitter`
+/// (sessão dedicada, `.m2` local já publicado com o fix) — M1 FECHOU DE VERDADE, nos DOIS
+/// backends**: {@link #reachesEarlyconBannerAcceiteM1Interpreted()} e
+/// {@link #reachesEarlyconBannerAcceiteM1Jit()} passam em menos de 1s cada (o marcador aparece
+/// bem cedo no log). Nenhum bug novo do `arm-jitter` apareceu nesta sessão além do que a B1.8 já
+/// tinha corrigido.
+///
+/// **M2 NÃO fechou nesta sessão — bloqueio NOVO, genuinamente diferente de BE8/CP15/desempenho**:
+/// com M1 destravado, o boot avança bem além do `earlycon` mas entra num LAÇO DE `Oops` do
+/// próprio kernel (`Unable to handle kernel paging request`, "8&lt;--- cut here ---" repetido)
+/// já em `unflatten_device_tree()`/`fdt_next_tag` (parsing do FDT via a janela de `fixmap`
+/// mapeada por virtual, logo depois do scan físico inicial que já funcionou — "Machine model:
+/// Raspberry Pi Model B", "Reserved memory: created CMA memory pool..." aparecem certinhos antes
+/// do loop começar), a poucas dezenas de milhares de instruções do banner do M1.
+///
+/// **Confirmado como divergência REAL via o oráculo QEMU 8.0.0** (`qemu-system-arm -M raspi1ap`,
+/// EXATAMENTE o mesmo `kernel.img`+`bcm2708-rpi-b.dtb`+`initramfs.cpio.gz`+cmdline desta classe):
+/// o QEMU boota limpo até enumerar USB (`dwc_otg`/`smsc95xx`) e monta o initramfs
+/// (`Trying to unpack rootfs image as initramfs...` / `Freeing initrd memory`), MUITO além de
+/// `Freeing unused kernel memory` — sem NENHUM Oops. Isto não é uma feature faltando (como o
+/// BE8 era): é uma divergência de comportamento observável entre este emulador e uma referência
+/// de hardware real para a MESMA entrada, ou seja, um bug real em algum lugar (`arm-jitter` ou
+/// `virtual-arm-box` — root cause NÃO isolado ainda).
+///
+/// **Investigação desta sessão (rastreamento instrução-a-instrução via `ArmTraceListener`
+/// temporário, removido antes do commit) e o que ficou pela frente**:
+/// - O texto do PRIMEIRO Oops (`PC is at fdt_next_tag+0xec/0x154`, endereço de falha de leitura
+///   `ff8ae000`, `*pgd=0800000e(bad)` — um descritor de SEÇÃO onde o kernel esperava uma tabela
+///   de 2º nível) já está no console ANTES de qualquer instrução observada pelo
+///   `ArmTraceListener` atingir o vetor de abort (`0xffff0010`/`0x00000010`). A primeira entrada
+///   de vetor que o listener de fato observa corresponde a um Oops LATER (`kmem_dump_obj+0xa8`,
+///   parte do próprio código de diagnóstico que o kernel roda AO IMPRIMIR o primeiro Oops — uma
+///   falha em cascata, não a causa raiz).
+/// - Isso indica que {@link dev.vitorsilverio.armjitter.core.ArmCore#runBlocks} (o caminho que
+///   {@link Bcm2835Machine#runSlice()} usa, via `JitRuntime#execute`) entrega pelo menos o
+///   PRIMEIRO abort sem passar pelo mesmo `afterInstruction`/`enterMemoryAbort` que
+///   {@link dev.vitorsilverio.armjitter.core.ArmCore#step()} usa — o texto do console é
+///   genuíno (o guest realmente imprimiu aquilo), mas a ferramenta de rastreamento por
+///   instrução tem uma lacuna de cobertura nesse caminho que impediu identificar QUAL instrução
+///   exata disparou o primeiro abort. Vale investigar essa lacuna de observabilidade por si só
+///   antes de tentar de novo — sem ela, é fácil consertar o sintoma errado.
+/// - Hipóteses NÃO eliminadas para a causa raiz real (nenhuma confirmada): (a) o passo de
+///   `fixmap_remap_fdt()` do kernel (que cria uma PTE nova pra mapear o FDT por virtual, fora do
+///   identity map inicial) não fica visível para um walk de página subsequente — TLB/MMU do
+///   `arm-jitter` ({@code TranslatingAddressSpace}) inspecionada nesta sessão e parece correta
+///   (miss sempre re-anda a tabela; `invalidateEntry` confere a tag antes de invalidar), mas não
+///   foi possível provar isso sob o caminho de bloco; (b) algo no tamanho/layout da RAM
+///   (256MiB fixo desta task vs. os ~448MiB que o QEMU sintetiza para `raspi1ap`) desloca onde o
+///   fixmap cai o suficiente para expor um bug de bordo; (c) o `.dtb` patcheado por
+///   {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} está correto (`FdtPatcherTest`
+///   cobre round-trip e os três campos de cabeçalho recalculados), mas não foi validado
+///   byte-a-byte contra o que `fixmap_remap_fdt()` espera do `totalsize` do cabeçalho.
+///
+/// Este achado é EXPLICITAMENTE do tipo "motivo genuinamente novo" que a task F3 instrui a
+/// documentar e PARAR, não improvisar um fix às cegas: não é BE8 (fechado pela B1.8), não é
+/// CP15 faltante (fechado na sessão 2/3) e não é desempenho (fechado na sessão 2/3 pelo
+/// `ZImageDecompressor`). M2/M3 continuam `@Disabled` até a causa raiz ser isolada numa sessão
+/// futura — comece pela lacuna de observabilidade do `ArmTraceListener` sob `runBlocks`/
+/// `JitRuntime#execute`, não pelo sintoma do Oops.
 ///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
-/// (CP15/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje; os testes
-/// de M1/M2/M3 ficam `@Disabled` até o suporte a BE8 (ou outra forma de contornar o `SETEND`
-/// bem cedo no boot) destravar um caminho de execução viável.
+/// (CP15/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi1");
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
@@ -96,31 +147,28 @@ class Raspi1BootTest {
         assertTrue(machine.core().cycles() > 0, "nenhum ciclo executado");
     }
 
-    @Disabled("M1 não fecha nesta sessão: bloqueado por um limite DELIBERADO e já documentado do "
-            + "arm-jitter (CPSR.E=1/big-endian, task B1.5 MVP), não um bug desta task — ver Javadoc "
-            + "da classe para o achado completo (2 bugs reais de CP15 já corrigidos nesta sessão) e "
-            + "o que falta.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerAcceiteM1Interpreted() throws Exception {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, EARLYCON_BANNER);
     }
 
-    @Disabled("M1 não fecha nesta sessão — ver Javadoc da classe.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerAcceiteM1Jit() throws Exception {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("M2 depende de M1 — ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão: laço de Oops NOVO (não BE8/CP15/desempenho) em "
+            + "unflatten_device_tree/fdt_next_tag, confirmado divergente do QEMU 8.0.0 como oráculo "
+            + "(mesmo kernel+dtb+initramfs). Causa raiz NÃO isolada — ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Interpreted() throws Exception {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M2 depende de M1 — ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão — ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {
