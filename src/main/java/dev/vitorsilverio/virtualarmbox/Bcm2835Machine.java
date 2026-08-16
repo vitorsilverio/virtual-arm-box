@@ -15,6 +15,7 @@ import dev.vitorsilverio.virtualarmbox.boot.ZImageDecompressor;
 import dev.vitorsilverio.virtualarmbox.device.OpenBus;
 import dev.vitorsilverio.virtualarmbox.device.Pl011Uart;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835ArmControlBlock;
+import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Cp14Extras;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Cp15Extras;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Ic;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Mailbox;
@@ -157,7 +158,7 @@ public final class Bcm2835Machine implements Machine {
 
         ArmCore core = new ArmCore(mmu, SwiDispatcher.empty(), architecture);
         Cp15VmsaCoprocessor cp15 = new Cp15VmsaCoprocessor(mmu, core);
-        core.setCoprocessorBus(new Bcm2835Cp15Extras(cp15));
+        core.setCoprocessorBus(new Bcm2835Cp14Extras(new Bcm2835Cp15Extras(cp15)));
         core.setMemoryAbortListener(cp15);
         core.setModeChangeListener(cp15);
 

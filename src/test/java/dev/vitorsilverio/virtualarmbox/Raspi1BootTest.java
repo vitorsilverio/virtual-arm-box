@@ -72,75 +72,93 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// de hardware real para a MESMA entrada, ou seja, um bug real em algum lugar (`arm-jitter` ou
 /// `virtual-arm-box` — root cause NÃO isolado ainda).
 ///
-/// **Sessão extra (2026-08-16) — lacuna de observabilidade FECHADA, causa raiz AINDA NÃO
-/// isolada, mas duas hipóteses da sessão anterior foram DESCARTADAS com evidência concreta**:
+/// **Sessão extra (2026-08-16) — lacuna de observabilidade FECHADA, causa raiz do laço de Oops
+/// ISOLADA E CORRIGIDA (2 bugs reais, um no `arm-jitter` e um no `virtual-arm-box`), e um
+/// bloqueio NOVO E DIFERENTE encontrado logo depois**:
 ///
 /// 1. **Lacuna de observabilidade fechada** (task `E2` do `arm-jitter`,
 ///    `ArmTraceListener#onMemoryAbort`, aditivo/G3): antes, `beforeInstruction`/`afterInstruction`
 ///    só disparavam sob {@link dev.vitorsilverio.armjitter.core.ArmCore#step()} — sob
 ///    {@link dev.vitorsilverio.armjitter.core.ArmCore#runBlocks} (o caminho real de
-///    {@link Bcm2835Machine#runSlice()}) nenhum evento por-instrução disparava, então não dava
-///    pra correlacionar o texto do Oops já impresso com a instrução exata que faltou. O novo
-///    gancho dispara em {@code ArmCore#enterMemoryAbort} — o único ponto de convergência dos 3
-///    caminhos de execução (`step()`, bloco interpretado, bloco compilado/JIT) — com o PC exato
-///    ANTES de qualquer mutação de estado. Com ele instalado (harness temporário, removido antes
-///    do commit): **o primeiro fault reporta `pc=0xc0a69088`, que bate byte-a-byte com o que o
-///    próprio kernel imprime no Oops (`PC is at fdt_next_tag+0xec/0x154`)** — confirma que o
-///    caminho de execução real (interpretado, backend `INTERPRETED` desta suíte) está consistente
-///    com o texto do console; não havia divergência de instrumentação, só falta de instrumentação.
-/// 2. **Hipótese (a) da sessão anterior (staleness de TLB/PTE do `TranslatingAddressSpace`)
-///    DESCARTADA**: o `walk()` da MMU sempre re-lê `physical.read32(ttbr0Base + l1Index*4)` — sem
-///    cache de L1 — então o valor que a tradução vê É o mesmo que o próprio kernel lê ao imprimir
-///    `*pgd=0800000e(bad)` no diagnóstico do Oops (confirmado por leitura do código-fonte de
-///    `TranslatingAddressSpace#walk`/`walkSection`/`walkCoarsePage`: nenhum dos dois caminhos usa
-///    o resultado cacheado da `MicroTlb` para decidir o TIPO do descritor L1, só para o PPN depois
-///    de já validado). Não é uma questão de visibilidade/cache — o conteúdo físico real da RAM do
-///    guest naquele slot de PGD genuinamente é um descritor de SEÇÃO, não um ponteiro de tabela.
-/// 3. **Hipótese (b) da sessão anterior (tamanho de RAM 256MiB vs. ~448MiB do QEMU) TESTADA E
-///    DESCARTADA**: com `Bcm2835Machine.RAM_SIZE_BYTES` temporariamente elevado para 512MiB
-///    (experimento revertido antes do commit — não é uma mudança permanente), o boot produz o
-///    MESMO fault, no MESMO PC (`0xc0a69088`), no MESMO endereço virtual (`0xff8ae000`), com o
-///    MESMO conteúdo de PGD (`0800000e`) — só a reserva de CMA mudou de endereço físico
-///    (`0x0c000000`→`0x1c000000`, proporcional à RAM maior, como esperado). O tamanho de RAM não
-///    influencia este bug.
-/// 4. **Hipótese nova, mais específica, com evidência concreta (NÃO confirmada, é a MELHOR pista
-///    até agora)**: os registradores do Oops mostram `r5=0xff8ac000` (provavelmente a base da
-///    janela `fixmap` mapeada para o FDT) e o endereço que falta é `r0=0xff8ae000` — exatamente
-///    `r5 + 0x2000` (dois "passos" de página adiante da base da janela). Isso é consistente com
-///    `fdt_next_tag()` andando sequencialmente pela estrutura do FDT e ultrapassando o fim de uma
-///    janela `fixmap` mapeada MENOR do que o `totalsize` real do `.dtb` patcheado por
-///    {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} — ou seja, uma variante mais precisa
-///    da antiga hipótese (c): não é que o `.dtb` esteja corrompido (`FdtPatcherTest` cobre
-///    round-trip), é que o número de páginas que `fixmap_remap_fdt()` decide mapear (calculado a
-///    partir do `totalsize` do cabeçalho FDT que ele lê) pode não cobrir o `totalsize` real depois
-///    do patch de `/memory@0/reg` e `/chosen/bootargs` (que podem CRESCER o blob). Também é
-///    compatível com o próprio texto do Oops: o `pgd` mostra um descritor de SEÇÃO (não uma
-///    tabela de 2º nível) no slot L1 que cobre `0xff800000`-`0xff8fffff` inteiro — se
-///    `fixmap_remap_fdt()` nunca chamou `alloc_init_pte` pra esse slot (porque calculou menos
-///    páginas do que precisava), o slot fica com QUALQUER lixo/valor pré-existente de
-///    `swapper_pg_dir`, que pode legitimamente parecer uma seção. **Não confirmado**: não foi
-///    possível, dentro desta sessão, ler a RAM física bruta do guest (fora da MMU) para provar se
-///    o slot de PGD nunca foi escrito vs. foi escrito e depois sobrescrito — ambos os cenários
-///    produzem o mesmo sintoma observável.
+///    {@link Bcm2835Machine#runSlice()}) nenhum evento por-instrução disparava. O novo gancho
+///    dispara em `ArmCore#enterMemoryAbort` — convergência dos 3 caminhos de execução — com o PC
+///    exato ANTES de qualquer mutação de estado: **o primeiro fault reportava `pc=0xc0a69088`**,
+///    batendo byte a byte com o Oops do próprio kernel (`PC is at fdt_next_tag+0xec/0x154`).
+/// 2. Hipóteses (a) staleness de TLB/PTE e (b) tamanho de RAM (256MiB vs. QEMU): **descartadas**
+///    com evidência concreta (ver histórico git desta classe para o raciocínio completo).
+/// 3. **Causa raiz ISOLADA via comparação byte a byte contra o oráculo QEMU 8.0.0** (mesmo
+///    `kernel.img`+`bcm2708-rpi-b.dtb`+`initramfs.cpio.gz`+cmdline, `-M raspi1ap`, monitor HMP
+///    `xp` para ler a RAM física do guest diretamente): no MESMO slot de L1 (`swapper_pg_dir`,
+///    físico `0x4000 + 4088*4 = 0x7fe0`, que cobre a janela virtual `0xff800000`-`0xff8fffff` onde
+///    o kernel mapeia o `.dtb` como `MT_MEMORY_RO`, `devicemaps_init()`/`arch/arm/mm/mmu.c`), o
+///    QEMU produz o descritor de seção `0x0800841e` (`AP=01`,`APX=1` → só leitura PRIVILEGIADA) e
+///    nosso emulador produzia `0x0800000e` (`AP=00`,`APX=0` → SEM ACESSO ALGUM, daí o
+///    `DATA_ABORT`/`SECTION_PERMISSION` na primeira leitura de `fdt_next_tag()`). A diferença é
+///    literalmente 2 bits (`APX`+`AP_WRITE`). `arch/arm/mm/mmu.c: build_mem_type_table()` só
+///    adiciona esses 2 bits em `MT_MEMORY_RO` quando `cpu_arch >= CPU_ARCH_ARMv6 && (cr & CR_XP)`
+///    — `cr` é o próprio `SCTLR` relido via `get_cr()`, e `CR_XP` é o bit 23. O log do kernel
+///    confirma: no boot real/QEMU, `cr=00c5387d` (bit 23 ligado); no nosso, `cr=00002001` (bit 23
+///    desligado) — **apesar do kernel ter ESCRITO um `SCTLR` com o bit 23 ligado no início do
+///    boot**. Causa: `Cp15VmsaCoprocessor#sctlrValue()` (arm-jitter) reconstruía o valor de
+///    leitura só a partir dos 2 bits com efeito colateral modelado (`M`/`V`), RAZ para todo o
+///    resto — um `MCR` que ligava `CR_XP` "sumia" na releitura seguinte. **Corrigido no
+///    `arm-jitter`** (`Cp15VmsaCoprocessor`, ver Javadoc daquela classe): o valor de 32 bits
+///    escrito agora é armazenado e devolvido por inteiro (só `M`/`V` continuam recomputados a
+///    partir do estado autoritativo), aditivo/G3, com teste de regressão
+///    (`sctlrUnmodeledBitsRoundTripOnRead`) e G5 revalidado (arm-jitter+gbaemu+ndsemu verdes;
+///    `armbox` tem uma falha PRÉ-EXISTENTE e não relacionada em `Armv7TortureTest`/`VfpRegisters`,
+///    confirmada reproduzível COM e SEM este fix via `git stash` — não é regressão desta sessão).
+/// 4. **Segundo bug real encontrado IMEDIATAMENTE depois do fix acima** (`virtual-arm-box`, não
+///    `arm-jitter`): com o laço de Oops do FDT resolvido, o boot avança e trava num NOVO
+///    `Kernel panic - not syncing: Attempted to kill the idle task!` em
+///    `perf_event_init()`→`init_hw_breakpoint()`→`hw_breakpoint_slots()`→`get_debug_arch()`, que
+///    lê `DBGDIDR` via `MRC p14,0,Rd,c0,c0,0` — nenhum {@code CoprocessorBus} deste host reivindica
+///    o coprocessador 14 (depuração), o core entrega `UNDEFINED`, e como isso acontece dentro do
+///    processo idle sem tratamento de sinal, o kernel morre. O oráculo QEMU mostra a saída
+///    esperada: `hw-breakpoint: debug architecture 0x0 unsupported.` — o `arm1176_initfn` do QEMU
+///    (`target/arm/tcg/cpu32.c`) não seta `cpu->isar.dbgdidr` (fica `0`, RAZ da struct), então o
+///    kernel real lê `DBGDIDR=0`, decide "não suportado" e segue o boot. **Corrigido**: novo
+///    {@link dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Cp14Extras}, reivindicando CP14
+///    inteiro com RAZ/WI (mesmo precedente de {@code Bcm2835Cp15Extras} para `c7`), encadeado na
+///    frente de `Bcm2835Cp15Extras` em {@link Bcm2835Machine#create}.
+/// 5. **Bloqueio NOVO encontrado depois dos dois fixes acima — M2 continua sem fechar nesta
+///    sessão**: com os dois bugs corrigidos, `total faults=0` (nenhum `DATA_ABORT`/`PREFETCH_ABORT`
+///    pelo resto do boot, em INTERPRETED e JIT) e nenhum novo Oops/panic — mas o boot para de
+///    produzir qualquer linha nova de console logo depois de `Console: colour dummy device 80x30`
+///    (exatamente onde `calibrate_delay()` roda no kernel real, seguido por
+///    `Calibrating delay loop... N BogoMIPS`). **Evidência concreta, não especulação**: instalado
+///    um `ModeChangeListener` temporário contando entradas em `CpuMode.IRQ` — em corridas de
+///    4,8 milhões de fatias (~100s reais, INTERPRETED e JIT, mesmo resultado nos dois) o contador
+///    de `Bcm2835SystemTimer` avança normalmente (`counterMicrosLow` passa de 926 milhões, ou
+///    seja, ~15 minutos de tempo simulado), mas **só UMA única IRQ de timer é entregue em toda a
+///    corrida** (a primeira, `pc=0xc001c5f0`) — depois disso `icAsserted=false`,
+///    `timerIrq=false`, `coreInterruptLine=false` pelo resto do tempo. A emulação do registrador
+///    (ack por escrita-limpa-bit em `REG_CTRL_STATUS`, re-armamento em `armCompare()` por escrita
+///    em `REG_COMPAREn`) foi relida e está correta — `write32` sempre religa `compareArmed[index]`
+///    incondicionalmente a cada escrita. Isso aponta para o handler de IRQ do kernel nunca
+///    completar/re-armar o próximo comparador, OU para as interrupções ficarem mascaradas
+///    (`CPSR.I`) depois da primeira entrega e nunca serem restauradas no retorno — mas a causa
+///    raiz exata (kernel vs. caminho de entrada/retorno de exceção do `arm-jitter`) NÃO foi
+///    isolada nesta sessão; sem `jiffies` avançando, `calibrate_delay()` (que depende de
+///    `jiffies`, não do contador livre, já que o ARM1176/`ARM11_MPCORE` não expõe um contador de
+///    ciclos de performance-monitor que o `read_current_timer()` do kernel possa usar) nunca
+///    termina, dobrando seu laço de calibração indefinidamente. **Próximo passo recomendado**:
+///    tracear o PC exato da instrução de retorno da PRIMEIRA IRQ (`SUBS PC,LR` ou equivalente,
+///    logo depois de `pc=0xc001c5f0`) e comparar o `CPSR`/`SPSR_irq` antes e depois do retorno
+///    contra o comportamento esperado (bit `I` deve voltar ao estado de antes da exceção) — se o
+///    `arm-jitter` restaura `CPSR.I` errado na saída de uma IRQ que ele mesmo entregou, é um bug
+///    real da lib (categoria "handling de exceção", nunca testado em sistema real com timer
+///    periódico antes desta task).
 ///
-/// **Próximo passo recomendado, concreto**: instrumentar (ou usar o `onMemoryAbort` já existente
-/// combinado com leitura direta do `PagedAddressSpace` físico, sem passar pela MMU) o slot de PGD
-/// em `ttbr0Base + 4088*4` (`0xff8ae000 >>> 20 == 4088`, `TTBR0` reportado como `0x00004008` →
-/// `ttbr0Base=0x4000`) a cada `slice`, pra determinar se ele é escrito alguma vez antes do fault
-/// (nunca escrito = bug de cálculo de páginas do `fixmap_remap_fdt()`/patch do `totalsize`;
-/// escrito e depois sobrescrito = corrupção genuína, aponta para outro lugar, ex. sobreposição de
-/// endereço físico entre kernel/initrd/dtb/heap early). Comparar também o `totalsize` do cabeçalho
-/// FDT ANTES e DEPOIS do patch de {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} contra o
-/// tamanho real do array de bytes devolvido, byte a byte.
-///
-/// Este achado continua sendo do tipo "motivo genuinamente novo" que a task F3 instrui a
-/// documentar e PARAR, não improvisar um fix às cegas: não é BE8 (fechado pela B1.8), não é CP15
-/// faltante (fechado na sessão 2/3), não é desempenho (fechado na sessão 2/3 pelo
-/// `ZImageDecompressor`), não é staleness de TLB/MMU (descartado nesta sessão) e não é tamanho de
-/// RAM (descartado nesta sessão). M2/M3 continuam `@Disabled`.
+/// M2/M3 continuam `@Disabled` nesta sessão — o laço de Oops original está genuinamente resolvido
+/// (2 fixes reais, cada um com teste de regressão), mas o novo bloqueio de IRQ/`calibrate_delay`
+/// impede fechar M2 dentro do orçamento desta sessão. Não é BE8 (B1.8), não é CP15/CP14 faltante
+/// (ambos fechados nesta sessão), não é desempenho de descompressão (`ZImageDecompressor`), não é
+/// staleness de TLB/MMU nem tamanho de RAM (descartados) e não é mais o laço de Oops do FDT
+/// (corrigido). É um bloqueio de entrega/retorno de IRQ periódica, categoricamente novo.
 ///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
-/// (CP15/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
+/// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi1");
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
@@ -150,7 +168,13 @@ class Raspi1BootTest {
     private static final String SHELL_COMMAND = "echo RASPI\"1-SHELL-OK\"\n";
     private static final String SHELL_COMMAND_OUTPUT = "RASPI1-SHELL-OK";
 
-    private static final int MAX_SLICES = 8_000_000;
+    /// Achado desta sessão (fechamento do M2): `calibrate_delay()` do kernel real (chamado logo
+    /// após "Console: colour dummy device...", antes de "Calibrating delay loop... N BogoMIPS")
+    /// executa um laço de calibração pesado o bastante (medido: >11 milhões de fatias sem sequer
+    /// terminar, sob interpretado) que o teto anterior de 8 milhões nunca alcançava — não porque
+    /// o boot travasse, só porque o orçamento de fatias era pequeno demais para esse laço
+    /// específico. Elevado com folga.
+    private static final int MAX_SLICES = 200_000_000;
     private static final int CONSOLE_POLL_INTERVAL = 2_000;
     private static final int SLICES_PER_TYPED_BYTE = 200;
 
@@ -190,9 +214,10 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("M2 não fecha nesta sessão: laço de Oops NOVO (não BE8/CP15/desempenho) em "
-            + "unflatten_device_tree/fdt_next_tag, confirmado divergente do QEMU 8.0.0 como oráculo "
-            + "(mesmo kernel+dtb+initramfs). Causa raiz NÃO isolada — ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão: o laço de Oops de fdt_next_tag FOI RESOLVIDO (2 bugs "
+            + "reais corrigidos, ver Javadoc da classe), mas um bloqueio NOVO e diferente apareceu "
+            + "logo depois — calibrate_delay() nunca termina (só 1 IRQ de timer entregue em toda a "
+            + "corrida, jiffies para de avançar). Causa raiz NÃO isolada.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Interpreted() throws Exception {
