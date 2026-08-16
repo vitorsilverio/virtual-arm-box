@@ -72,41 +72,72 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// de hardware real para a MESMA entrada, ou seja, um bug real em algum lugar (`arm-jitter` ou
 /// `virtual-arm-box` — root cause NÃO isolado ainda).
 ///
-/// **Investigação desta sessão (rastreamento instrução-a-instrução via `ArmTraceListener`
-/// temporário, removido antes do commit) e o que ficou pela frente**:
-/// - O texto do PRIMEIRO Oops (`PC is at fdt_next_tag+0xec/0x154`, endereço de falha de leitura
-///   `ff8ae000`, `*pgd=0800000e(bad)` — um descritor de SEÇÃO onde o kernel esperava uma tabela
-///   de 2º nível) já está no console ANTES de qualquer instrução observada pelo
-///   `ArmTraceListener` atingir o vetor de abort (`0xffff0010`/`0x00000010`). A primeira entrada
-///   de vetor que o listener de fato observa corresponde a um Oops LATER (`kmem_dump_obj+0xa8`,
-///   parte do próprio código de diagnóstico que o kernel roda AO IMPRIMIR o primeiro Oops — uma
-///   falha em cascata, não a causa raiz).
-/// - Isso indica que {@link dev.vitorsilverio.armjitter.core.ArmCore#runBlocks} (o caminho que
-///   {@link Bcm2835Machine#runSlice()} usa, via `JitRuntime#execute`) entrega pelo menos o
-///   PRIMEIRO abort sem passar pelo mesmo `afterInstruction`/`enterMemoryAbort` que
-///   {@link dev.vitorsilverio.armjitter.core.ArmCore#step()} usa — o texto do console é
-///   genuíno (o guest realmente imprimiu aquilo), mas a ferramenta de rastreamento por
-///   instrução tem uma lacuna de cobertura nesse caminho que impediu identificar QUAL instrução
-///   exata disparou o primeiro abort. Vale investigar essa lacuna de observabilidade por si só
-///   antes de tentar de novo — sem ela, é fácil consertar o sintoma errado.
-/// - Hipóteses NÃO eliminadas para a causa raiz real (nenhuma confirmada): (a) o passo de
-///   `fixmap_remap_fdt()` do kernel (que cria uma PTE nova pra mapear o FDT por virtual, fora do
-///   identity map inicial) não fica visível para um walk de página subsequente — TLB/MMU do
-///   `arm-jitter` ({@code TranslatingAddressSpace}) inspecionada nesta sessão e parece correta
-///   (miss sempre re-anda a tabela; `invalidateEntry` confere a tag antes de invalidar), mas não
-///   foi possível provar isso sob o caminho de bloco; (b) algo no tamanho/layout da RAM
-///   (256MiB fixo desta task vs. os ~448MiB que o QEMU sintetiza para `raspi1ap`) desloca onde o
-///   fixmap cai o suficiente para expor um bug de bordo; (c) o `.dtb` patcheado por
-///   {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} está correto (`FdtPatcherTest`
-///   cobre round-trip e os três campos de cabeçalho recalculados), mas não foi validado
-///   byte-a-byte contra o que `fixmap_remap_fdt()` espera do `totalsize` do cabeçalho.
+/// **Sessão extra (2026-08-16) — lacuna de observabilidade FECHADA, causa raiz AINDA NÃO
+/// isolada, mas duas hipóteses da sessão anterior foram DESCARTADAS com evidência concreta**:
 ///
-/// Este achado é EXPLICITAMENTE do tipo "motivo genuinamente novo" que a task F3 instrui a
-/// documentar e PARAR, não improvisar um fix às cegas: não é BE8 (fechado pela B1.8), não é
-/// CP15 faltante (fechado na sessão 2/3) e não é desempenho (fechado na sessão 2/3 pelo
-/// `ZImageDecompressor`). M2/M3 continuam `@Disabled` até a causa raiz ser isolada numa sessão
-/// futura — comece pela lacuna de observabilidade do `ArmTraceListener` sob `runBlocks`/
-/// `JitRuntime#execute`, não pelo sintoma do Oops.
+/// 1. **Lacuna de observabilidade fechada** (task `E2` do `arm-jitter`,
+///    `ArmTraceListener#onMemoryAbort`, aditivo/G3): antes, `beforeInstruction`/`afterInstruction`
+///    só disparavam sob {@link dev.vitorsilverio.armjitter.core.ArmCore#step()} — sob
+///    {@link dev.vitorsilverio.armjitter.core.ArmCore#runBlocks} (o caminho real de
+///    {@link Bcm2835Machine#runSlice()}) nenhum evento por-instrução disparava, então não dava
+///    pra correlacionar o texto do Oops já impresso com a instrução exata que faltou. O novo
+///    gancho dispara em {@code ArmCore#enterMemoryAbort} — o único ponto de convergência dos 3
+///    caminhos de execução (`step()`, bloco interpretado, bloco compilado/JIT) — com o PC exato
+///    ANTES de qualquer mutação de estado. Com ele instalado (harness temporário, removido antes
+///    do commit): **o primeiro fault reporta `pc=0xc0a69088`, que bate byte-a-byte com o que o
+///    próprio kernel imprime no Oops (`PC is at fdt_next_tag+0xec/0x154`)** — confirma que o
+///    caminho de execução real (interpretado, backend `INTERPRETED` desta suíte) está consistente
+///    com o texto do console; não havia divergência de instrumentação, só falta de instrumentação.
+/// 2. **Hipótese (a) da sessão anterior (staleness de TLB/PTE do `TranslatingAddressSpace`)
+///    DESCARTADA**: o `walk()` da MMU sempre re-lê `physical.read32(ttbr0Base + l1Index*4)` — sem
+///    cache de L1 — então o valor que a tradução vê É o mesmo que o próprio kernel lê ao imprimir
+///    `*pgd=0800000e(bad)` no diagnóstico do Oops (confirmado por leitura do código-fonte de
+///    `TranslatingAddressSpace#walk`/`walkSection`/`walkCoarsePage`: nenhum dos dois caminhos usa
+///    o resultado cacheado da `MicroTlb` para decidir o TIPO do descritor L1, só para o PPN depois
+///    de já validado). Não é uma questão de visibilidade/cache — o conteúdo físico real da RAM do
+///    guest naquele slot de PGD genuinamente é um descritor de SEÇÃO, não um ponteiro de tabela.
+/// 3. **Hipótese (b) da sessão anterior (tamanho de RAM 256MiB vs. ~448MiB do QEMU) TESTADA E
+///    DESCARTADA**: com `Bcm2835Machine.RAM_SIZE_BYTES` temporariamente elevado para 512MiB
+///    (experimento revertido antes do commit — não é uma mudança permanente), o boot produz o
+///    MESMO fault, no MESMO PC (`0xc0a69088`), no MESMO endereço virtual (`0xff8ae000`), com o
+///    MESMO conteúdo de PGD (`0800000e`) — só a reserva de CMA mudou de endereço físico
+///    (`0x0c000000`→`0x1c000000`, proporcional à RAM maior, como esperado). O tamanho de RAM não
+///    influencia este bug.
+/// 4. **Hipótese nova, mais específica, com evidência concreta (NÃO confirmada, é a MELHOR pista
+///    até agora)**: os registradores do Oops mostram `r5=0xff8ac000` (provavelmente a base da
+///    janela `fixmap` mapeada para o FDT) e o endereço que falta é `r0=0xff8ae000` — exatamente
+///    `r5 + 0x2000` (dois "passos" de página adiante da base da janela). Isso é consistente com
+///    `fdt_next_tag()` andando sequencialmente pela estrutura do FDT e ultrapassando o fim de uma
+///    janela `fixmap` mapeada MENOR do que o `totalsize` real do `.dtb` patcheado por
+///    {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} — ou seja, uma variante mais precisa
+///    da antiga hipótese (c): não é que o `.dtb` esteja corrompido (`FdtPatcherTest` cobre
+///    round-trip), é que o número de páginas que `fixmap_remap_fdt()` decide mapear (calculado a
+///    partir do `totalsize` do cabeçalho FDT que ele lê) pode não cobrir o `totalsize` real depois
+///    do patch de `/memory@0/reg` e `/chosen/bootargs` (que podem CRESCER o blob). Também é
+///    compatível com o próprio texto do Oops: o `pgd` mostra um descritor de SEÇÃO (não uma
+///    tabela de 2º nível) no slot L1 que cobre `0xff800000`-`0xff8fffff` inteiro — se
+///    `fixmap_remap_fdt()` nunca chamou `alloc_init_pte` pra esse slot (porque calculou menos
+///    páginas do que precisava), o slot fica com QUALQUER lixo/valor pré-existente de
+///    `swapper_pg_dir`, que pode legitimamente parecer uma seção. **Não confirmado**: não foi
+///    possível, dentro desta sessão, ler a RAM física bruta do guest (fora da MMU) para provar se
+///    o slot de PGD nunca foi escrito vs. foi escrito e depois sobrescrito — ambos os cenários
+///    produzem o mesmo sintoma observável.
+///
+/// **Próximo passo recomendado, concreto**: instrumentar (ou usar o `onMemoryAbort` já existente
+/// combinado com leitura direta do `PagedAddressSpace` físico, sem passar pela MMU) o slot de PGD
+/// em `ttbr0Base + 4088*4` (`0xff8ae000 >>> 20 == 4088`, `TTBR0` reportado como `0x00004008` →
+/// `ttbr0Base=0x4000`) a cada `slice`, pra determinar se ele é escrito alguma vez antes do fault
+/// (nunca escrito = bug de cálculo de páginas do `fixmap_remap_fdt()`/patch do `totalsize`;
+/// escrito e depois sobrescrito = corrupção genuína, aponta para outro lugar, ex. sobreposição de
+/// endereço físico entre kernel/initrd/dtb/heap early). Comparar também o `totalsize` do cabeçalho
+/// FDT ANTES e DEPOIS do patch de {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} contra o
+/// tamanho real do array de bytes devolvido, byte a byte.
+///
+/// Este achado continua sendo do tipo "motivo genuinamente novo" que a task F3 instrui a
+/// documentar e PARAR, não improvisar um fix às cegas: não é BE8 (fechado pela B1.8), não é CP15
+/// faltante (fechado na sessão 2/3), não é desempenho (fechado na sessão 2/3 pelo
+/// `ZImageDecompressor`), não é staleness de TLB/MMU (descartado nesta sessão) e não é tamanho de
+/// RAM (descartado nesta sessão). M2/M3 continuam `@Disabled`.
 ///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
