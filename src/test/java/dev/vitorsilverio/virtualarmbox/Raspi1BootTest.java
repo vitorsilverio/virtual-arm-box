@@ -195,6 +195,37 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// entrada em `CpuMode.IRQ`, para confirmar se o código do handler do timer chega a ser
 /// alcançado.
 ///
+/// **Sessão de reconhecimento (2026-08-16, só diagnóstico direto de periférico, sem trace de
+/// instrução — mais barato de rodar primeiro) — achado NOVO que restringe bastante o espaço de
+/// causa raiz**: um experimento temporário (harness removido antes do commit, mesmo precedente
+/// da sessão anterior) amostrou `Bcm2835SystemTimer`/`Bcm2835Ic` DIRETO (via `read32`, sem passar
+/// pela CPU) a cada 5.000 fatias, por 2.000.000 de fatias (INTERPRETED). Resultado: `COMPARE3`/
+/// `CTRL_STATUS`/`IRQ_ENABLE_1` mudam **exatamente uma vez** — em ~75.000 fatias, o comparador é
+/// armado (`COMPARE3=0x2769`) e a IRQ é desmascarada no controlador (`IRQ_ENABLE_1` bit3, ou
+/// seja, `request_irq`+`irq_unmask` do driver `bcm2835-armctrl-ic` SUCEDERAM de verdade) — e então
+/// `CTRL_STATUS` bit3 fica pendente (`0x08`) e **nunca mais muda pelas 1.925.000 fatias
+/// seguintes**, nem `COMPARE3` é rearmado. Ou seja: não é "o handler parou de rodar depois de um
+/// tempo" (o que a sessão anterior media por amostragem grossa a cada 1M fatias parecia sugerir)
+/// — é **o corpo do handler nunca roda nem uma ÚNICA vez**, apesar do `request_irq`/`irq_unmask`
+/// terem sido bem-sucedidos e da CPU reentrar em `CpuMode.IRQ` continuamente (achado da sessão
+/// anterior). Isso é consistente com hardware real se o handler de nível superior
+/// (`bcm2835_handle_irq`/`asm_do_IRQ`, instalado via `set_handle_irq`) nunca identificar a fonte
+/// pendente corretamente e devolver sem despachar — a linha `nIRQ` continua alta legitimamente
+/// (nunca é um artefato de obsolescência da sondagem por fatia de `Bcm2835Machine#runSlice`,
+/// que só looparia se o handler CHEGASSE a rodar e o host não tivesse repolled a tempo — não é
+/// o caso aqui, já que o handler nunca roda). **Restringe a hipótese (a) do bloqueio anterior**
+/// (dispatcher de nível superior nunca alcança o ISR do timer) como a mais provável; a hipótese
+/// (b) (efeito da escrita não chegando ao dispositivo) fica MENOS provável, já que não há
+/// evidência de nenhuma escrita nem tentativa — o registrador nunca muda, não muda para um valor
+/// "errado". Próximo passo recomendado (ainda não executado): o trace instrução-a-instrução via
+/// `ArmCore#step()` já recomendado na sessão anterior, mas agora com um alvo mais específico —
+/// confirmar se o PC, ao reentrar em `CpuMode.IRQ` repetidamente, chega a alcançar o corpo de
+/// `bcm2835_handle_irq`/o vetor de `generic_handle_irq` do driver `irq-bcm2835.c`, ou se retorna
+/// antes disso (ex.: um `asm_do_IRQ`/`irq_svc` que trata a IRQ como espúria e nunca lê
+/// `IRQ_PENDING_1`/`IRQ_PENDING_2` do nosso `Bcm2835Ic`). `mvn -o test` verde no `virtual-arm-box`
+/// (nenhum arquivo de produção tocado nesta sessão — só o harness temporário, removido); M1/M2/M3
+/// continuam no mesmo estado desta e da sessão anterior.
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
