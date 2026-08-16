@@ -59,6 +59,34 @@ class Bcm2835Cp15ExtrasTest {
     }
 
     @Test
+    void idMmfr0IsRealArm1176ValueUsedByBuildMemTypeTable() {
+        // F3/sessão 2 (raspi1/ARMv6K): `mmu.c: build_mem_type_table()` lê `ID_MMFR0` (`c0,c1,4`)
+        // bem cedo em `paging_init()` — sem esse registrador a leitura caía no
+        // `Cp15VmsaCoprocessor` genérico (só conhece `CRm=0`) e lançava UNDEFINED, achado real
+        // que travava o boot do raspi1 num laço infinito de PREFETCH_ABORT (ver Javadoc da
+        // classe). Regressão: `ID_MMFR0` bate com `arm1176_initfn` do QEMU.
+        Bcm2835Cp15Extras extras = new Bcm2835Cp15Extras(new RecordingDelegate());
+        int idMmfr0 = extras.read(CP15, OPCODE1_ID, CRN_ID, /* CRm= */ 1, /* opcode2= */ 4);
+        assertEquals(0x0113_0003, idMmfr0);
+    }
+
+    @Test
+    void idIsarRegistersAreRealArm1176Values() {
+        Bcm2835Cp15Extras extras = new Bcm2835Cp15Extras(new RecordingDelegate());
+        assertEquals(0x0140_011, extras.read(CP15, OPCODE1_ID, CRN_ID, /* CRm= */ 2, /* opcode2= */ 0));
+        assertEquals(0x1200_2111, extras.read(CP15, OPCODE1_ID, CRN_ID, /* CRm= */ 2, /* opcode2= */ 1));
+    }
+
+    @Test
+    void unmodeledIdRegisterEntriesReadAsZero() {
+        // ID_MMFR3 e ID_ISAR5 não são setados por `arm1176_initfn` — RAZ, não UNDEFINED.
+        Bcm2835Cp15Extras extras = new Bcm2835Cp15Extras(new RecordingDelegate());
+        assertEquals(0, extras.read(CP15, OPCODE1_ID, CRN_ID, /* CRm= */ 1, /* opcode2= */ 7));
+        assertEquals(0, extras.read(CP15, OPCODE1_ID, CRN_ID, /* CRm= */ 2, /* opcode2= */ 5));
+        assertTrue(extras.handles(CP15, OPCODE1_ID, CRN_ID, /* CRm= */ 1, /* opcode2= */ 7));
+    }
+
+    @Test
     void idRegistersAreReadOnly() {
         RecordingDelegate delegate = new RecordingDelegate();
         Bcm2835Cp15Extras extras = new Bcm2835Cp15Extras(delegate);
