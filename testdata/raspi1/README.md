@@ -64,13 +64,50 @@ versatilepb, se o `busybox-armv5l` rodar" — não foi necessário baixar uma va
 
 ## Mapa de memória / boot usado por este repo
 
-`Bcm2835Machine` carrega `kernel.img` em `0x00010000` (protocolo direto de boot do QEMU —
-`KERNEL_LOAD_ADDR` de `hw/arm/boot.c` — não os `0x8000` do bootloader proprietário real, que
-este repo não tem) e `initramfs.cpio.gz` em `0x08000000` (RAM de 256MiB: metade da RAM, mesma
-fórmula do `hw/arm/boot.c` usada pelo `versatilepb`), o `.dtb` patcheado
-(`FdtPatcher.withBootargs`+`withMemorySize`) alinhado a 4KiB logo após o initramfs, e entra em
-`0x00010000` com `r0=0`, `r1=3138` (`0x0C42`, `MACH_TYPE_BCM2708` — ignorado por kernels DT
-modernos, passado por segurança), `r2=<endereço do dtb>`.
+**Atualizado na sessão 2/3**: `kernel.img` não é mais carregado cru. A sessão 1 media que
+descomprimir os ~7,7MB do `kernel.img` byte a byte DENTRO do guest (o `inflate()` do próprio
+stub `head.S`/`misc.c`) custava ~750 milhões de ciclos — caro demais para terminar num
+orçamento de sessão/CI razoável. `Bcm2835Machine` agora descomprime no HOST
+(`boot.ZImageDecompressor`, achado: o payload é um stream gzip padrão embutido no zImage,
+localizável pelo magic `1F 8B 08`, mesma técnica do `scripts/extract-vmlinux` do kernel Linux)
+e carrega a imagem JÁ DESCOMPRIMIDA em `0x00008000` (`ZImageDecompressor.TEXT_OFFSET` —
+o `AUTO_ZRELADDR` que o stub calcularia em tempo de execução para um zImage carregado bem
+abaixo de 128MiB, é também o endereço de boot clássico do Raspberry Pi real), com o PC do core
+apontando direto para o `stext` do kernel. `initramfs.cpio.gz` continua em `0x08000000` (RAM de
+256MiB: metade da RAM, mesma fórmula do `hw/arm/boot.c` usada pelo `versatilepb`), o `.dtb`
+patcheado (`FdtPatcher.withBootargs`+`withMemorySize`) alinhado a 4KiB logo após o initramfs.
+Entrada em `0x00008000` com `r0=0`, `r1=3138` (`0x0C42`, `MACH_TYPE_BCM2708` — ignorado por
+kernels DT modernos, passado por segurança), `r2=<endereço do dtb>` — o resto do protocolo de
+entrada não muda.
+
+## Achados de CP15 corrigidos no `arm-jitter` (sessão 2/3)
+
+Destravar a descompressão revelou que o boot avançava muito mais fundo no kernel real — e
+esbarrava em DOIS registradores CP15 do esquema ARMv6+ que o `Cp15VmsaCoprocessor`/
+`Bcm2835Cp15Extras` ainda não conheciam (primeira validação de sistema real do
+`ARM11_MPCORE`/ARMv6K neste repo). Os dois causavam UNDEFINED tão cedo no boot que os vetores
+de exceção ainda não tinham sido copiados por `early_trap_init()`, cascateando num laço
+infinito de `PREFETCH_ABORT` (a busca da PRÓPRIA rotina de vetor também falhava):
+
+1. `MCR p15,0,Rt,c13,c0,3` (`TPIDRURO`, ponteiro de TLS) — corrigido no `arm-jitter`
+   (`Cp15VmsaCoprocessor`): `c13,c0,{0,2,3,4}` (FCSEIDR/TPIDRURW/TPIDRURO/TPIDRPRW) viraram
+   armazenamento simples, sem efeito colateral.
+2. `MRC p15,0,Rt,c0,c1,4` (`ID_MMFR0`, usado por `build_mem_type_table()`) e depois `c0,c3,4`
+   (sub-registrador do esquema CPUID sem nome nesta revisão da arquitetura) — corrigido em
+   `Bcm2835Cp15Extras`: a arquitetura ARM GARANTE que ler um sub-registrador de ID não
+   alocado/reservado devolve um valor UNKNOWN (aqui `0`), NUNCA lança UNDEFINED (mecanismo de
+   compatibilidade futura do próprio esquema CPUID) — em vez de listar `CRm` um a um, a classe
+   agora reivindica o esquema `c0`/`opcode1=0` inteiro.
+
+Depois dos dois fixes, o boot avança centenas de milhares de ciclos a mais (dezenas de funções
+de kernel distintas visitadas, confirmado por rastreamento instrução-a-instrução) e esbarra num
+LIMITE DELIBERADO e já documentado do `arm-jitter` (não um bug): `CPSR.E=1`/acesso a dado
+big-endian (`SETEND BE`, ARMv6) não é suportado (`IrExecutionSupport.checkLittleEndianData`,
+task `B1.5` do `arm-jitter`, MVP explicitamente só little-endian). O kernel ARMv6K real toca
+isso bem cedo no boot (antes de `setup_arch()`, console ainda vazio). Ver Javadoc de
+`Raspi1BootTest` para o detalhe completo — M1 ainda não fecha por causa deste limite, que é
+funcionalidade nova no `arm-jitter` (não um bug desta task) e fica para decisão de sessão
+futura.
 
 ## Oráculo de validação
 
