@@ -570,13 +570,49 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 ///    `@Disabled` atualizado); `VersatilePbBootTest` continua verde. Nenhum arquivo do `arm-jitter`
 ///    tocado nesta sessão.
 ///
+/// **Sessão de correção do marcador de M2 (2026-08-17) — M2 FECHADO nos DOIS backends**: seguindo
+/// o próximo passo recomendado pela sessão anterior (harness com progresso observável em vez do
+/// `@Test` cru), um harness temporário confirmou que o boot JIT já reproduz `Run /init as init
+/// process` em ~40s reais (2,4 milhões de fatias) e NUNCA trava/aborta a partir daí — a suspeita
+/// da sessão anterior ("resultado genuinamente desconhecido") estava certa em espírito, mas a
+/// causa real não era um bloqueio novo: era o texto literal do marcador. `mark_readonly()` (que só
+/// roda DEPOIS de `free_initmem()` em `kernel_init()`) já tinha impresso sua mensagem
+/// ("This architecture does not have kernel memory protection") ANTES de "Run /init" aparecer no
+/// console — ou seja, `free_initmem()` já tinha rodado, só que com um texto diferente do enunciado
+/// da task. Capturado ao vivo: `"Freeing unused kernel image (initmem) memory: 500K"` — kernels
+/// modernos (confirmado neste `kernel.img` 6.18.33) unificaram a mensagem de memória do `initmem`
+/// com a de imagem do kernel, mesmo precedente exato da redefinição de M1 (texto do enunciado não
+/// bate com o kernel oficial real desta task). Corrigido o marcador para o prefixo estável
+/// `"Freeing unused kernel"` (ver Javadoc de {@link #FREEING_KERNEL_MEMORY}) e reativados os dois
+/// testes de M2 (removido `@Disabled`): **JIT passa em 38,7s, INTERPRETED passa em 50,2s** — bem
+/// mais rápido que o esperado pelas sessões anteriores, porque o marcador correto acontece muito
+/// mais cedo no boot que o ponto (mmc0/SDIO, muito mais tardio) onde o harness de diagnóstico desta
+/// sessão continuou observando (sem crash, mas em retry aparentemente indefinido — **achado
+/// colateral para M3**: não bloqueia M2, mas se M3 precisar que o boot avance por muito mais tempo
+/// além do prompt do shell, o retry de `mmc0`/`sdhost-bcm2835` "no support for card's volts" pode
+/// dominar o console; ver "Não inclui" da spec — SD/MMC real é deliberadamente fora de escopo,
+/// então isso é esperado, não um bug). `mvn -o test` verde no `virtual-arm-box`; nenhum arquivo do
+/// `arm-jitter` tocado nesta sessão (G5 completo não necessário, só o G5 "leve" deste repo).
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi1");
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
     private static final String EARLYCON_BANNER = "Booting Linux on physical CPU";
-    private static final String FREEING_KERNEL_MEMORY = "Freeing unused kernel memory";
+    /// **Sessão de correção do marcador de M2 (2026-08-17)**: o texto literal do enunciado
+    /// (`"Freeing unused kernel memory"`) NUNCA aparece neste `kernel.img` real (6.18.33) — não
+    /// por bug, por REDAÇÃO: um harness de diagnóstico temporário (mesmo padrão de sessões
+    /// anteriores, ver Javadoc da classe) confirmou que `mark_readonly()`/"This architecture does
+    /// not have kernel memory protection" (que só roda DEPOIS de `free_initmem()` em
+    /// `kernel_init()`) já tinha passado quando "Run /init as init process" apareceu — ou seja,
+    /// `free_initmem()` já tinha rodado, só que com outra frase. O texto real capturado é
+    /// `"Freeing unused kernel image (initmem) memory: 500K"` (kernels modernos unificam a
+    /// mensagem de memória de init com a de imagem, ao contrário do texto mais antigo do
+    /// enunciado da task). Mesmo precedente da redefinição de M1 (marcador do enunciado não bate
+    /// com o kernel oficial real desta task) — usa-se um prefixo estável que cobre as duas
+    /// redações.
+    private static final String FREEING_KERNEL_MEMORY = "Freeing unused kernel";
     private static final String SHELL_PROMPT = "/ #";
     private static final String SHELL_COMMAND = "echo RASPI\"1-SHELL-OK\"\n";
     private static final String SHELL_COMMAND_OUTPUT = "RASPI1-SHELL-OK";
@@ -627,29 +663,12 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("M2 não fecha nesta sessão: o fix de linux,initrd-start/end (ver Javadoc da classe) "
-            + "foi validado só no backend JIT -- o INTERPRETED não foi re-executado (orçamento da "
-            + "sessão), deve se beneficiar do mesmo fix (FdtPatcher é comum aos dois motores). Ver "
-            + "Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Interpreted() throws Exception {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("MCRR/MRRC decodificado e encaminhado pela cadeia de decorators CP15/CP14 nesta "
-            + "sessão (achado real: handlesDouble/readDouble/writeDouble não eram repassados pelos "
-            + "decorators, mascarando o fix de decode no boot real mesmo com testes de unidade "
-            + "verdes). Re-execução deste teste NÃO concluiu nesta sessão: passou de ~40min sem "
-            + "produzir saída (heap JVM ainda crescendo lentamente, não travado) e foi abortada "
-            + "manualmente -- o @Timeout de 30min do JUnit em modo SAME_THREAD não preempte um "
-            + "laço apertado, só reporta falha DEPOIS que o método retorna (mesmo problema já "
-            + "documentado para o INTERPRETED em sessão anterior). Resultado genuinamente "
-            + "desconhecido: não sabemos se o fix fecha M2, se há um bloqueio novo mais tardio, ou "
-            + "se o boot real é só mais lento que 40min neste ponto. Próximo passo recomendado: "
-            + "repetir com um harness temporário com progresso observável (print periódico de PC/"
-            + "console a cada N fatias, como em sessões anteriores) em vez do @Test cru, para não "
-            + "gastar outra rodada às cegas. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {
