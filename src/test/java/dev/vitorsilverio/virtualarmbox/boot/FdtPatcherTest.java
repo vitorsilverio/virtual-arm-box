@@ -114,6 +114,48 @@ class FdtPatcherTest {
     }
 
     @Test
+    void disablesNodeWithLongerStatusValue() throws IOException {
+        assumeTrue(Files.exists(DTB), "asset real ausente nesta checkout");
+        byte[] original = Files.readAllBytes(DTB);
+
+        byte[] patched = FdtPatcher.withNodeDisabled(original, "mmc@7e202000");
+
+        assertHeaderConsistent(patched);
+        // "okay\0" (5 bytes, padded to 8) -> "disabled\0" (9 bytes, padded to 12): blob cresce.
+        assertTrue(patched.length > original.length,
+                "blob deveria crescer: 'disabled\\0' é mais longo que 'okay\\0'");
+        assertContainsAsciiOnce(patched, "disabled\0");
+    }
+
+    @Test
+    void disablingNodeRoundTripsBackToOkay() throws IOException {
+        assumeTrue(Files.exists(DTB), "asset real ausente nesta checkout");
+        byte[] original = Files.readAllBytes(DTB);
+
+        byte[] disabled = FdtPatcher.withNodeDisabled(original, "mmc@7e202000");
+        byte[] roundTrip = FdtPatcher.withProperty(disabled, "mmc@7e202000", "status",
+                "okay\0".getBytes(StandardCharsets.US_ASCII));
+
+        assertHeaderConsistent(roundTrip);
+        assertEquals(original.length, roundTrip.length,
+                "voltar para 'okay' deveria recuperar o tamanho original do blob");
+    }
+
+    @Test
+    void disablesNodeThatHasNoStatusPropertyYet() throws IOException {
+        assumeTrue(Files.exists(DTB), "asset real ausente nesta checkout");
+        byte[] original = Files.readAllBytes(DTB);
+
+        // usb@7e980000 não tem `status` no .dtb cru (ausência == "okay" por definição do DT) —
+        // exercita o caminho de CRIAÇÃO de withNodeDisabled, diferente do de mmc@7e202000 acima.
+        byte[] patched = FdtPatcher.withNodeDisabled(original, "usb@7e980000");
+
+        assertHeaderConsistent(patched);
+        assertTrue(patched.length > original.length, "blob deveria crescer: propriedade nova");
+        assertContainsAsciiOnce(patched, "disabled\0");
+    }
+
+    @Test
     void rejectsInvalidMagic() {
         byte[] garbage = new byte[64];
         assertThrows(IllegalArgumentException.class, () -> FdtPatcher.withBootargs(garbage, "x"));

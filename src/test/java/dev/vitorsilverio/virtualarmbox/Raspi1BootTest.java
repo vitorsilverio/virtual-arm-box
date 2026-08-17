@@ -616,6 +616,68 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// para desabilitar o nó `mmc@7e202000` via `status = "disabled"`). `mvn -o test` verde no
 /// `virtual-arm-box`; nenhum arquivo do `arm-jitter` tocado nesta sessão.
 ///
+/// **Sessão de extensão do `FdtPatcher` (2026-08-17) — DOIS bloqueios reais fechados
+/// (`mmc0`/`sdhost` E `usb`/`dwc_otg`), M3 ainda NÃO fecha (TERCEIRO bloqueio novo, revelado
+/// logo depois, causa raiz não isolada)**:
+///
+/// 1. Seguiu o próximo passo recomendado pela sessão anterior:
+///    {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher#withNodeDisabled} novo — ao
+///    contrário do que a sessão anterior presumiu, NÃO precisou de nenhuma extensão estrutural
+///    (o {@code withProperty} interno já lidava com troca de TAMANHO de propriedade, mesmo
+///    caminho que `withBootargs` já exercita). {@link Bcm2835Machine#create} passou a desabilitar
+///    `mmc@7e202000` (`status = "okay"` → `"disabled"`, SOBRESCRITA).
+/// 2. **Efeito confirmado via harness de diagnóstico temporário** (`Raspi1DiagTempTest`, removido
+///    antes do commit, mesmo precedente de sessões anteriores): o retry infinito de `mmc0` REALMENTE
+///    desaparece (`mmc0count=0` do início ao fim de uma corrida de 72,6 milhões de fatias, ~30min
+///    reais) — mas o console fica preso, agora SILENCIOSAMENTE (sem spam), num tamanho ESTÁVEL
+///    (`consoleLen=32869`) a partir de ~12,6 milhões de fatias, com a última linha sendo
+///    `"state() pending due to 20980000.usb"`.
+/// 3. **Segundo bloqueio real isolado e corrigido, mesma sessão**: `20980000.usb` é o nó
+///    `usb@7e980000` (`compatible = "brcm,bcm2708-usb"`, o `dwc_otg`) — deliberadamente fora do
+///    "Inclui" da spec (servido por `OpenBus`), mas ao contrário de `mmc0` (que faz retry ruidoso
+///    para sempre), o driver USB real fica preso numa espera SÍNCRONA e SILENCIOSA (`state()
+///    pending`, provavelmente `device_pm_wait_for_dev`/`dpm_prepare` esperando o `probe()` do
+///    controlador nunca concluir sob `OpenBus`) — sem nenhum printk periódico, então o sintoma no
+///    console é ausência total de crescimento, não inundação. `withNodeDisabled` foi generalizado
+///    para lidar com os dois casos reais do `.dtb` (SOBRESCRITA quando `status` já existe, como em
+///    `mmc@7e202000`; CRIAÇÃO quando não existe, como em `usb@7e980000` — a ausência de `status`
+///    significa "okay" por definição do Device Tree) tentando `withProperty` e caindo para
+///    `withNewProperty` em caso de propriedade ausente. {@link Bcm2835Machine#create} passou a
+///    desabilitar `usb@7e980000` também.
+/// 4. **Efeito confirmado ao vivo**: com os dois nós desabilitados, `mmc0count` continua `0` E o
+///    console avança MUITO além do ponto anterior — `"Run /init as init process"` aparece de novo
+///    (consoleLen sobe de 32869 para 34036) — mas **M3 ainda NÃO fecha**: um TERCEIRO bloqueio,
+///    novo e diferente dos dois anteriores, aparece imediatamente depois — o console fica
+///    ESTÁVEL em `consoleLen=34036` por pelo menos 24 milhões de fatias adicionais (~10 minutos
+///    reais observados nesta sessão, harness interrompido por orçamento, não por timeout do
+///    teste) sem NENHUMA linha nova — nem o banner do próprio `/init` deste repositório (um
+///    `echo` simples, sem dependência de hardware nenhuma, que a sessão do CPRMAN já registrou
+///    como o primeiro sinal esperado depois de `/init` rodar), nem o prompt do shell. Isso sugere
+///    que o processo `init` trava (ou o scheduler nunca faz progresso visível) ANTES de sequer
+///    executar seu primeiro `echo` — categoricamente diferente de mmc0 (retry ruidoso) e de usb
+///    (espera síncrona identificável por nome de dispositivo no log): aqui não há NENHUMA pista
+///    textual do que está travando.
+/// 5. **Causa raiz do terceiro bloqueio NÃO isolada nesta sessão** (orçamento de investigação
+///    aberta esgotado depois dos dois fixes de DTB acima). **Próximo passo recomendado,
+///    concreto**: trace instrução-a-instrução (`ArmCore#step()`, backend INTERPRETED, mesma
+///    técnica das sessões de CPSR.E/tempestade de IRQ) a partir do ponto exato onde
+///    `"Run /init as init process"` é impresso, para descobrir se a CPU está presa em `WFI` sem
+///    IRQ chegando (suspeita nº1, dado o precedente da tempestade de IRQ já corrigida — mas agora
+///    a suspeita seria falta de entrega, não excesso), num laço de espera de alguma outra chamada
+///    de sistema que o `execve("/init")`/`do_execve` faz cedo (ex.: leitura de mais páginas do
+///    initramfs, alocação de pilha do processo), ou outra causa ainda não cogitada. Comparar
+///    contra o oráculo QEMU 8.0.0 (mesmo kernel+DTB+initramfs+cmdline, sem os nós de `mmc`/`usb`
+///    desabilitados, já que o QEMU tem drivers reais para eles) não serve diretamente aqui — mas
+///    reproduzir com o `.dtb` PATCHEADO (os dois nós desabilitados) no QEMU também, se possível,
+///    isolaria se o comportamento é específico deste emulador ou uma consequência esperada de
+///    desabilitar os nós (ex.: algum script de init do busybox espera por `/dev/mmcblk0`
+///    silenciosamente antes de imprimir qualquer coisa — precisaria ser confirmado lendo o
+///    `init`/`inittab` do `initramfs.cpio.gz` desta task, não investigado ainda).
+/// 6. `mvn -o test` verde no `virtual-arm-box` (agora com {@code FdtPatcherTest} +3 testes novos
+///    de `withNodeDisabled`, cobrindo os dois casos — sobrescrita e criação — mais um round-trip);
+///    M3 volta a `@Disabled` com o achado atualizado (não fecha nesta sessão). Nenhum arquivo do
+///    `arm-jitter` tocado (G5 completo não necessário, só o G5 "leve" deste repo).
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
@@ -697,18 +759,24 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M3: sessao do CPRMAN fechou o bloqueio de ETIMEDOUT/deferred-probe do ttyAMA0, mas "
-            + "revelou um novo bloqueio (retry infinito de mmc0/sdhost inundando o console) — ver "
-            + "Javadoc de Bcm2835Machine para o achado completo e o proximo passo recomendado.")
+    @Disabled("M3: sessao do FdtPatcher/status=disabled fechou mmc0/sdhost E usb/dwc_otg (dois "
+            + "bloqueios reais), mas revelou um TERCEIRO bloqueio logo apos 'Run /init as init "
+            + "process' — console fica com tamanho ESTAVEL por dezenas de milhoes de fatias sem "
+            + "nenhuma linha nova (nem o echo do proprio /init, que nao depende de hardware "
+            + "nenhum) — ver Javadoc de Bcm2835Machine para o achado completo e o proximo passo "
+            + "recomendado.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void bootsToInteractiveBusyboxShellAcceiteM3Interpreted() throws Exception {
         assertReachesInteractiveShell(Bcm2835Machine.Backend.INTERPRETED);
     }
 
-    @Disabled("M3: sessao do CPRMAN fechou o bloqueio de ETIMEDOUT/deferred-probe do ttyAMA0, mas "
-            + "revelou um novo bloqueio (retry infinito de mmc0/sdhost inundando o console) — ver "
-            + "Javadoc de Bcm2835Machine para o achado completo e o proximo passo recomendado.")
+    @Disabled("M3: sessao do FdtPatcher/status=disabled fechou mmc0/sdhost E usb/dwc_otg (dois "
+            + "bloqueios reais), mas revelou um TERCEIRO bloqueio logo apos 'Run /init as init "
+            + "process' — console fica com tamanho ESTAVEL por dezenas de milhoes de fatias sem "
+            + "nenhuma linha nova (nem o echo do proprio /init, que nao depende de hardware "
+            + "nenhum) — ver Javadoc de Bcm2835Machine para o achado completo e o proximo passo "
+            + "recomendado.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void bootsToInteractiveBusyboxShellAcceiteM3Jit() throws Exception {

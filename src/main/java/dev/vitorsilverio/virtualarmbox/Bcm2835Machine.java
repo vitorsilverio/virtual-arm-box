@@ -82,21 +82,24 @@ import java.io.OutputStream;
 /// do orçamento atual de `Raspi1BootTest#MAX_SLICES`, muito além do que um `@Test` bloqueante
 /// desta sessão conseguiu validar dentro do orçamento de tool-calls).
 ///
-/// **Próximo passo recomendado, concreto**: (a) o caminho mais barato é provavelmente
-/// desabilitar o nó `mmc@7e202000` (`sdhost`) no `.dtb` via `status = "disabled"` — o `.dtb` real
-/// já usa essa propriedade em outros nós (confirmado por inspeção de bytes), mas isso exige
-/// estender {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} para SUBSTITUIR uma
-/// propriedade existente por um valor de tamanho DIFERENTE (`"okay\0"` tem 5 bytes, `"disabled
-/// \0"` tem 9) — os métodos atuais (`withBootargs`/`withMemorySize`) só sobrescrevem em tamanho
-/// fixo; `withInitrdRange` só cria propriedades novas, nenhum dos dois serve sem modificação.
-/// Isto NÃO foi implementado nesta sessão (fora do "Inclui" desta task, decisão explícita de
-/// parar e não improvisar); (b) alternativa mais arriscada: revisitar
-/// `HOST_CYCLES_PER_MICROSECOND` para acoplar melhor tempo simulado a tempo real — mas isso é uma
-/// mudança de modelo de tempo mais ampla, com risco de regressão em M1/M2 (calibrados com o valor
-/// atual), não recomendada sem medir o efeito nos dois; (c) confirmar, com um trace mais longo
-/// (fora do orçamento desta sessão), se o prompt realmente aparece dado tempo suficiente — se sim,
-/// talvez baste rodar `Raspi1BootTest`'s M3 num ambiente com mais tempo disponível (CI, não uma
-/// sessão de agente), sem nenhuma mudança de código adicional.
+/// **Sessão de extensão do `FdtPatcher` (2026-08-17) — os dois nós `mmc@7e202000`/`usb@7e980000`
+/// agora são desabilitados via `status = "disabled"`** ({@link FdtPatcher#withNodeDisabled},
+/// aplicado abaixo em {@link #create}) — ao contrário do que esta seção presumia, a sobrescrita
+/// de propriedade de tamanho diferente NÃO exigiu nenhuma extensão estrutural do `FdtPatcher`
+/// (o caminho de sobrescrita genérico já suportava isso, só faltava expô-lo). Isso fechou o
+/// retry infinito de `mmc0`/`sdhost` E, achado NOVO desta sessão, uma espera síncrona silenciosa
+/// do driver `usb`/`dwc_otg` (`"state() pending due to 20980000.usb"`, sem nenhuma linha de log
+/// periódica — ao contrário do `mmc0`, este bloqueio não inunda o console, só o congela). Com os
+/// dois desabilitados, o boot volta a avançar e `"Run /init as init process"` reaparece — mas
+/// **M3 continua NÃO fechando**: um TERCEIRO bloqueio, novo e diferente dos dois anteriores,
+/// congela o console de novo IMEDIATAMENTE depois, desta vez sem nenhuma pista textual (nem
+/// mensagem de espera, nem Oops) — nem o `echo` do próprio `/init` deste repositório (que não
+/// depende de hardware nenhum) chega a aparecer em dezenas de milhões de fatias adicionais. Ver
+/// Javadoc de `Raspi1BootTest` (seção "Sessão de extensão do FdtPatcher") para o relato completo
+/// e o próximo passo recomendado (trace instrução-a-instrução a partir do ponto onde `"Run /init
+/// as init process"` é impresso, para descobrir se é `WFI`-sem-IRQ, uma outra espera síncrona, ou
+/// algo no próprio script de `init` do busybox reagindo à ausência dos dois dispositivos
+/// desabilitados).
 public final class Bcm2835Machine implements Machine {
     /// RAM do Model B rev 1 (256MiB) — o `.dtb` cru vem com `/memory@0/reg` zerado (achado real,
     /// ver Javadoc de {@link FdtPatcher}); este é o valor que o hospedeiro escreve ali.
@@ -133,6 +136,25 @@ public final class Bcm2835Machine implements Machine {
     /// `CPRMAN_OFFSET = 0x101000` em `raspi_platform.h` do QEMU, relativo à base de periféricos
     /// do Pi 1 (`0x2000_0000`) — ver Javadoc de {@link Bcm2835Cprman}.
     private static final int CPRMAN_BASE = 0x2010_1000;
+
+    /// Nome do nó `sdhost` no `.dtb` real (`/soc/mmc@7e202000`, `compatible = "brcm,bcm2835-
+    /// sdhost"`) — desabilitado via {@link FdtPatcher#withNodeDisabled} (ver Javadoc da classe e
+    /// da task F3): sem cartão SD real (deliberadamente fora do "Inclui"), `mmc_rescan` faria
+    /// retry infinito e inundaria o console mais rápido do que o tempo real de teste consegue
+    /// esperar, dado que {@link Bcm2835SystemTimer} comprime tempo-de-CPU-emulado numa proporção
+    /// fixa desacoplada do relógio real.
+    private static final String SDHOST_NODE_NAME = "mmc@7e202000";
+
+    /// Nome do nó `usb` no `.dtb` real (`/soc/usb@7e980000`, `compatible = "brcm,bcm2708-usb"`,
+    /// o `dwc_otg`) — desabilitado pelo mesmo motivo que {@link #SDHOST_NODE_NAME}, achado numa
+    /// sessão de diagnóstico posterior da task F3: sem controlador USB real (deliberadamente
+    /// fora do "Inclui" — ver "Não inclui" da spec), o driver real fica preso indefinidamente num
+    /// `state() pending due to 20980000.usb` silencioso (nenhuma linha nova no console, ao
+    /// contrário do retry ruidoso de `mmc0`) — o console fica com tamanho ESTÁVEL por dezenas de
+    /// milhões de fatias seguidas, sem Oops nem progresso. Ao contrário de `mmc@7e202000`, este
+    /// nó não tem propriedade `status` no `.dtb` cru (ausência == "okay" por definição do Device
+    /// Tree) — {@link FdtPatcher#withNodeDisabled} cria a propriedade em vez de sobrescrever.
+    private static final String USB_NODE_NAME = "usb@7e980000";
 
     /// `raspi_platform.h`: fontes GPU do `Bcm2835Ic` usadas por esta task. Os 4 comparadores do
     /// `Bcm2835SystemTimer` mapeiam 1:1 nas fontes GPU 0-3 (`hw/timer/bcm2835_systmr.c` do QEMU,
@@ -252,8 +274,10 @@ public final class Bcm2835Machine implements Machine {
 
         byte[] dtbWithBootargsAndMemory =
                 FdtPatcher.withMemorySize(FdtPatcher.withBootargs(dtb, cmdline), RAM_SIZE_BYTES);
-        byte[] patchedDtb = FdtPatcher.withInitrdRange(
+        byte[] dtbWithInitrd = FdtPatcher.withInitrdRange(
                 dtbWithBootargsAndMemory, INITRD_LOAD_ADDR, INITRD_LOAD_ADDR + initramfs.length);
+        byte[] dtbWithSdhostDisabled = FdtPatcher.withNodeDisabled(dtbWithInitrd, SDHOST_NODE_NAME);
+        byte[] patchedDtb = FdtPatcher.withNodeDisabled(dtbWithSdhostDisabled, USB_NODE_NAME);
         loadBytes(physical, dtbAddress, patchedDtb);
 
         core.configureExecutionState(

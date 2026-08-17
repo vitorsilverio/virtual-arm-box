@@ -37,6 +37,10 @@ import java.util.Deque;
 ///   destas duas propriedades em `/chosen`. Sem elas, o kernel ignora o initramfs inteiro e, como
 ///   a cmdline pede `root=/dev/ram`, tenta montar `/dev/ram` como um dispositivo de bloco
 ///   formatado — que não é — e entra em pânico (`VFS: Unable to mount root fs`).
+/// - **`status` de um nó de dispositivo** ({@link #withNodeDisabled}) — SOBRESCRITA (o `.dtb` real
+///   sempre já tem `status = "okay"` em todo nó de dispositivo), usada para desabilitar o
+///   `sdhost` (`mmc@7e202000`) na task F3 e evitar que o driver de SD/MMC (deliberadamente fora
+///   de escopo) sonde hardware inexistente e inunde o console em retry infinito.
 ///
 /// Como o valor de `bootargs` quase sempre tem tamanho diferente do antigo (mas `reg` sempre
 /// tem o MESMO tamanho — 2 células de 32 bits, endereço+tamanho, confirmado pela inspeção acima
@@ -111,6 +115,38 @@ public final class FdtPatcher {
                 singleCell(initrdEndPhysicalAddress));
     }
 
+    /// Devolve uma cópia de `dtb` com a propriedade `status` do nó `nodeName` ajustada para
+    /// `"disabled\0"` — achado da sessão de investigação do retry infinito de `mmc0`/`sdhost` E
+    /// da trava silenciosa de `usb`/`dwc_otg` da task F3 (ver Javadoc de `Bcm2835Machine`): sem
+    /// cartão SD nem controlador USB reais (ambos deliberadamente fora do "Inclui" desta task),
+    /// os drivers reais do kernel ficam presos sondando/esperando hardware que `OpenBus` nunca
+    /// vai responder de forma que os satisfaça. Desabilitar o nó pelo Device Tree evita que o
+    /// driver sequer tente.
+    ///
+    /// Lida com os DOIS casos observados nos nós reais do `.dtb` desta task, tentando primeiro a
+    /// SOBRESCRITA ({@link #withProperty}, o caminho comum — `mmc@7e202000` já tem
+    /// `status = "okay"`) e caindo para CRIAÇÃO ({@link #withNewProperty}) se o nó não tiver
+    /// `status` nenhum (`usb@7e980000` não tem — a ausência da propriedade já significa "okay"
+    /// por definição do Device Tree, `Documentation/devicetree/bindings/`). Ao contrário do que
+    /// uma sessão anterior presumiu, o caminho de sobrescrita NÃO precisou de nenhuma extensão
+    /// estrutural nova: {@link #withProperty} já lida com troca de TAMANHO de propriedade (é o
+    /// mesmo caminho que {@link #withBootargs} usa — `patchesBootargsToLongerValue`/
+    /// `patchesBootargsToShorterValue` em `FdtPatcherTest` já provam isso).
+    ///
+    /// @param nodeName nome do nó (ex.: `"mmc@7e202000"`) — o mesmo formato que
+    ///                 {@link #withMemorySize} já usa para `"memory@0"`; casa pelo nome do nó, não
+    ///                 pelo caminho completo (suficiente enquanto o nome for único na árvore, como
+    ///                 é o caso de todo nó de dispositivo do `.dtb` real desta task)
+    /// @throws IllegalArgumentException se o nó não existir no FDT
+    public static byte[] withNodeDisabled(byte[] dtb, String nodeName) {
+        byte[] disabledValue = "disabled\0".getBytes(StandardCharsets.US_ASCII);
+        try {
+            return withProperty(dtb, nodeName, "status", disabledValue);
+        } catch (IllegalArgumentException propertyNotFound) {
+            return withNewProperty(dtb, nodeName, "status", disabledValue);
+        }
+    }
+
     /// `linux,initrd-start`/`linux,initrd-end` são células únicas de 32 bits nesta árvore (mesmo
     /// `#address-cells = 1` já confirmado por `/memory@0/reg`, `MEMORY_REG_BYTES`).
     private static byte[] singleCell(long value) {
@@ -122,7 +158,10 @@ public final class FdtPatcher {
         return cell;
     }
 
-    private static byte[] withProperty(byte[] dtb, String nodeName, String propertyName, byte[] newValue) {
+    /// Pacote-privado (não `private`) para que `FdtPatcherTest` possa reaproveitá-lo diretamente
+    /// num teste de ida-e-volta de {@link #withNodeDisabled} sem duplicar a lógica de sobrescrita
+    /// genérica — não faz parte da API pública da classe.
+    static byte[] withProperty(byte[] dtb, String nodeName, String propertyName, byte[] newValue) {
         int magic = readWord(dtb, FIELD_MAGIC * Integer.BYTES);
         if (magic != MAGIC) {
             throw new IllegalArgumentException(
