@@ -184,6 +184,9 @@ public final class VersatilePbMachine implements Machine {
         // Terceiro gancho do CP15 (B4.1.5): modo privilegiado vs. usuário para os bits AP da
         // tabela de páginas. Sem ele o copy-on-write do fork() do Linux nunca falta.
         core.setModeChangeListener(cp15);
+        // Quarto gancho do CP15 (F3): CPSR.E forçado a SCTLR.EE na entrada de exceção. Sem ele um
+        // handler pode herdar CPSR.E=1 de um trecho de código interrompido em plena SETEND BE.
+        core.setExceptionEndiannessPolicy(cp15);
 
         loadBytes(physical, KERNEL_LOAD_ADDR, kernelZImage);
         loadBytes(physical, INITRD_LOAD_ADDR, initramfs);

@@ -186,6 +186,7 @@ public final class Bcm2835Machine implements Machine {
         core.setCoprocessorBus(new Bcm2835Cp14Extras(new Bcm2835Cp15Extras(cp15)));
         core.setMemoryAbortListener(cp15);
         core.setModeChangeListener(cp15);
+        core.setExceptionEndiannessPolicy(cp15);
 
         byte[] decompressedKernel = ZImageDecompressor.decompress(kernelZImage);
         loadBytes(physical, DECOMPRESSED_KERNEL_LOAD_ADDR, decompressedKernel);

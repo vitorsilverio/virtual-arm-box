@@ -451,6 +451,63 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 ///    que seta bit 9 por engano) em vez de comportamento genuíno do kernel — o kernel LE normal não
 ///    deveria precisar de `SETEND` nesta fase do boot.
 ///
+/// **Sessão de fechamento do CPSR.E (2026-08-17) — causa raiz ISOLADA E CORRIGIDA (bug real do
+/// `arm-jitter`), abort storm 100% RESOLVIDO, M2 ainda NÃO fecha (bloqueio novo, bem mais tardio,
+/// já com causa raiz identificada)**:
+///
+/// 1. **A origem exata de `CPSR.E=true`, pendente desde a sessão anterior, foi isolada**: um trace
+///    instrução-a-instrução via {@link dev.vitorsilverio.armjitter.core.ArmCore#step()} a partir
+///    do boot (só ~320 mil instruções até o primeiro flip — MUITO mais cedo do que a suspeita
+///    "perto do fault" da sessão anterior) capturou o instante exato: `SETEND BE` (`0xf1010200`)
+///    em `0xc0a65c84`, seguido ~60 instruções depois por `SETEND LE` (`0xf1010000`) em
+///    `0xc0a6616c`/`0xc0a66228` — **o próprio kernel Linux real executa este par
+///    deliberadamente**, ao redor de uma rotina perto do laço ocioso. Não é bug de decodificação:
+///    o `arm-jitter` decodifica/executa `SETEND` corretamente nos dois casos.
+/// 2. **A causa raiz real é arquitetural, não de decodificação**: o ARM ARM (DDI 0406C B1.8.3)
+///    exige que hardware real reprograme `CPSR.E` para `SCTLR.EE` em TODA entrada de exceção,
+///    independente do que o código interrompido tinha configurado via `SETEND` — isso garante que
+///    todo handler de exceção rode numa endianness conhecida mesmo interrompendo um trecho
+///    legitimamente em `SETEND BE`. `AProfileExceptionModel#enterException` (arm-jitter) nunca
+///    fazia isso: `CPSR.E` era simplesmente herdado do contexto interrompido. Quando a IRQ do
+///    timer chegava bem no meio da janela `SETEND BE`/`SETEND LE` do kernel, o handler de exceção
+///    (`vector_stub`) herdava `E=1` e o próprio `LDR LR,[PC,LR,LSL#2]` que busca seu alvo de salto
+///    na tabela de branch (um acesso de DADOS comum) lia os 4 bytes invertidos — o
+///    `0xc0008d20`→`0x208d00c0` já identificado na sessão anterior.
+/// 3. **Corrigido no `arm-jitter`**: {@link dev.vitorsilverio.armjitter.core.ExceptionEndiannessPolicy}
+///    novo (mesmo padrão aditivo de `ModeChangeListener`/`MemoryAbortListener` — vazio por padrão,
+///    G3), chamado por `AProfileExceptionModel#enterException` logo depois do `CPSR` antigo já
+///    estar salvo em `SPSR`; {@link dev.vitorsilverio.armjitter.memory.mmu.Cp15VmsaCoprocessor}
+///    implementa a interface, forçando `CPSR.E = SCTLR.EE` (bit 25). {@link Bcm2835Machine#create}
+///    e {@link VersatilePbMachine#create} registram `core.setExceptionEndiannessPolicy(cp15)`
+///    (quarto gancho do CP15). 3 testes de regressão novos no arm-jitter
+///    (`ExceptionEndiannessPolicyTest` + `Cp15VmsaCoprocessorTest.applyOnExceptionEntry...`).
+///    `mvn -o test` verde no arm-jitter (1370 core + 13 truffle) + `mvn -o install`; G5 revalidado
+///    (gbaemu verde, ndsemu verde, armbox 40/41 — mesma falha pré-existente de
+///    `Armv7TortureTest`/`VfpRegisters` de sempre, não é regressão; `virtual-arm-box` verde).
+/// 4. **Efeito no boot, confirmado ao vivo**: com o fix, o abort storm em `0x208d00c0` desaparece
+///    por completo — o boot avança MUITO além do ponto anterior (`raspberrypi-firmware`/mailbox,
+///    `mmc0`, enumeração USB) até tentar montar a raiz de verdade. **M2 ainda NÃO fecha**: um
+///    bloqueio NOVO e bem mais tardio aparece — `Kernel panic - not syncing: VFS: Unable to mount
+///    root fs on "/dev/ram" or unknown-block(1,0)`, em `prepare_namespace()`. Como este panic
+///    acontece DENTRO de `kernel_init_freeable()` (chamado ANTES de `free_initmem()` na sequência
+///    real do `kernel_init()`), a mensagem `Freeing unused kernel memory` nunca é alcançada —
+///    consistente com o kernel real, não um sintoma de regressão.
+/// 5. **Causa raiz do bloqueio novo já identificada (não corrigida nesta sessão)**: o `FdtPatcher`
+///    escreve `/chosen/bootargs`/`/memory@0/reg` mas NUNCA `/chosen/linux,initrd-start`/
+///    `linux,initrd-end` — as duas propriedades que um kernel com Device Tree (ao contrário do
+///    protocolo ATAGs do `versatilepb`, que usa `ATAG_INITRD2`) precisa para descobrir onde o
+///    `initramfs.cpio.gz` carregado na RAM está. Sem elas, o kernel ignora o blob inteiro e, como
+///    a cmdline pede `root=/dev/ram`, tenta montar `/dev/ram` como um dispositivo de bloco
+///    formatado — que não é, daí o panic. **Próximo passo recomendado, concreto**: estender
+///    {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} para CRIAR propriedades novas num nó
+///    existente (hoje só sobrescreve o valor de propriedades já presentes, ver o Javadoc daquela
+///    classe — `/chosen` já existe no `.dtb` real, só faltam as 2 propriedades), escrever
+///    `linux,initrd-start`/`linux,initrd-end` (endereço físico onde `initramfs.cpio.gz` foi
+///    carregado, `INITRD_LOAD_ADDR`/`INITRD_LOAD_ADDR + initramfs.length` de
+///    {@link Bcm2835Machine}) e então tentar de novo os testes `@Disabled` do M2 (o INTERPRETED
+///    nem chegou a ser re-executado nesta sessão, mas deve se beneficiar do mesmo fix de CPSR.E —
+///    a causa raiz é comum aos dois motores).
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
@@ -508,26 +565,27 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("M2 não fecha nesta sessão: a tempestade de IRQ (bug real do arm-jitter, corrigido) "
-            + "está RESOLVIDA — em JIT o boot agora passa de calibrate_delay()/devtmpfs, muito além "
-            + "do ponto anterior — mas um bloqueio NOVO e diferente aparece logo depois: Oops de "
-            + "instrução UNDEFINED em vfp_enable()+0x8 (chamado por on_each_cpu_cond_mask<-vfp_init, "
-            + "com IRQs desligadas), matando o processo `init`. Ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão: o bug do CPSR.E (ver sessão de fechamento da classe) foi "
+            + "corrigido no arm-jitter e validado no backend JIT, mas o backend INTERPRETED não foi "
+            + "re-executado (orçamento da sessão) -- deve se beneficiar do mesmo fix, já que a causa "
+            + "raiz é no ArmCore/AProfileExceptionModel, comum aos dois motores. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Interpreted() throws Exception {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M2 não fecha nesta sessão: corrigido um bug real de tipagem no arm-jitter "
-            + "(InvalidationAwareAddressSpace não encaminhava fetch16/32/translationGeneration, "
-            + "causando DATA_ABORT em vez de PREFETCH_ABORT numa falha de busca) mas o mesmo "
-            + "endereço-raiz 0x208d00c0 continua faltando (agora corretamente como INSTRUCTION_FETCH) "
-            + "-- 27,5 milhões de reaborts idênticos observados. Causa raiz concreta identificada: um "
-            + "LDR LR,[PC,LR,LSL#2] do vector_stub de IRQ (Rd==Rm) le a tabela de branch em "
-            + "big-endian quando CPSR.E oscila para true perto do laco ocioso, produzindo o alvo de "
-            + "salto invertido em bytes (0xc0008d20 -> 0x208d00c0). Origem exata de CPSR.E=true ainda "
-            + "NAO isolada. Ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão: o bug do CPSR.E (achado principal desta sessão, ver "
+            + "Javadoc da classe) foi CORRIGIDO -- o abort storm desapareceu por completo e o boot "
+            + "avança MUITO além do ponto anterior (mailbox/USB/mmc0 inicializam, kernel tenta montar "
+            + "root) -- mas um bloqueio NOVO e mais tardio aparece: 'Kernel panic - VFS: Unable to "
+            + "mount root fs on \"/dev/ram\"'. Causa raiz já identificada (não corrigida ainda): o "
+            + "FdtPatcher não escreve '/chosen/linux,initrd-start'/'linux,initrd-end' no DTB, então o "
+            + "kernel nunca aprende onde o initramfs carregado na RAM está -- ele tenta montar "
+            + "'/dev/ram' como um dispositivo de bloco formatado (que não é) em vez de descompactar o "
+            + "cpio como initramfs. Precisa estender o FdtPatcher para CRIAR propriedades novas (hoje "
+            + "só sobrescreve as existentes, ver Javadoc de FdtPatcher) -- fora do orçamento desta "
+            + "sessão. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {
