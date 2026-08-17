@@ -381,6 +381,76 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 ///    usada para o bug de `SCTLR`/`CR_XP`) no mesmo ponto do boot é o próximo passo mais barato
 ///    antes de instrumentar mais.
 ///
+/// **Sessão de trace instrução-a-instrução do abort storm (2026-08-16/17) — 1 bug real do
+/// `arm-jitter` ISOLADO, CORRIGIDO E VALIDADO (G5 completo), mas M2 ainda NÃO fecha: a causa raiz
+/// do abort storm em si (endereço `0x208d00c0`) foi NARROWED a um achado concreto e novo, não
+/// totalmente isolada ainda**:
+///
+/// 1. **Bug real corrigido no `arm-jitter`**: seguindo o próximo passo recomendado pela sessão
+///    anterior (trace via {@link dev.vitorsilverio.armjitter.core.ArmCore#step()} a partir de
+///    ~77 mil fatias, fast-forward via JIT + troca para `step()` só nos últimos passos, técnica de
+///    duas fases), o primeiro fault foi confirmado IDÊNTICO ao já registrado
+///    (`instructionAddress=fault.virtualAddress()=0x208d00c0`, `SECTION_TRANSLATION`), mas agora
+///    reportado como `DATA_READ` — o que é ERRADO: o fault acontece na BUSCA da instrução em
+///    `0x208d00c0` (o novo PC depois de um `MOVS PC,LR`), deveria ser `INSTRUCTION_FETCH`. Causa:
+///    `dev.vitorsilverio.armjitter.memory.InvalidationAwareAddressSpace` (o decorador que a sessão
+///    anterior passou a usar em {@link Bcm2835Machine#create} para resolver o bug de SMC/kprobes)
+///    NUNCA sobrescrevia `fetch16`/`fetch32` — caíam no `default` de `AddressSpace`, que delega à
+///    PRÓPRIA `read32` do decorador (o caminho de DADOS do delegado), não a `fetch32` dele (o
+///    caminho de INSTRUÇÃO, com TLB separada). Toda busca de instrução sob este decorador perdia a
+///    TLB de instrução E o tipo `INSTRUCTION_FETCH` — uma falha de busca virava `DATA_ABORT` em vez
+///    de `PREFETCH_ABORT` (vetor errado, correção de PC errada -4 vs. -8). Mesma lacuna encontrada
+///    em `DualInvalidationAwareAddressSpace` (usado pelo `ndsemu`) e em `translationGeneration()`
+///    (também não encaminhado, quebraria invalidação de bloco JIT após troca de `TTBR0`/`CONTEXTIDR`
+///    para qualquer consumidor futuro que combine MMU com este decorador). **Corrigido no
+///    `arm-jitter`**: as duas classes agora sobrescrevem `fetch16`/`fetch32`/`translationGeneration`
+///    encaminhando ao delegado — aditivo/G3, 4 testes de regressão novos (2 por classe: um delegado
+///    de teste com valores DIFERENTES em `fetchNN` vs. `readNN` prova que o caminho certo é chamado;
+///    sanidade confirmada via `git stash`, os 2 testes falham exatamente como esperado sem o fix).
+///    `mvn -o test` verde no `arm-jitter` + `mvn -o install`; G5 revalidado (gbaemu verde, ndsemu
+///    verde, armbox 40/41 — mesma falha pré-existente de `Armv7TortureTest`/`VfpRegisters` já
+///    documentada em toda sessão anterior da F3, não é regressão).
+/// 2. **Aplicado o fix e reproduzido de novo**: o fault agora É `INSTRUCTION_FETCH` corretamente —
+///    mas o MESMO endereço (`0x208d00c0`) continua faltando (`SECTION_TRANSLATION`), e deixar a
+///    execução CONTINUAR além do primeiro fault (em vez de parar nele) mostra 27,5 MILHÕES de
+///    reaborts idênticos em 400 mil fatias sem o console crescer nem 1 byte — confirma que o fix
+///    de tipagem sozinho não fecha M2 (é uma correção real e correta, mas não é a causa raiz do
+///    travamento).
+/// 3. **Achado NOVO e concreto sobre a causa raiz real**: a instrução que produz `0x208d00c0` foi
+///    identificada por trace registrador-a-registrador: é o `LDR LR,[PC,LR,LSL#2]` (`0xe79fe10e`)
+///    do `vector_stub` de IRQ do kernel real (`arch/arm/kernel/entry-armv.S`) em `0xffff1044` — o
+///    idioma clássico de despacho por tabela de branch, com `Rd==Rm==r14` (o mesmo registrador é
+///    base do deslocamento E destino). Dump direto da RAM confirma que a TABELA em si está
+///    perfeita: `0xffff1058` (índice 3, modo SVC interrompido) contém `0xc0008d20`, um endereço de
+///    `.text` do kernel plausível (`__irq_svc`). Só que o `LDR` LÊ e devolve `0x208d00c0` — que é
+///    EXATAMENTE `0xc0008d20` com os 4 bytes invertidos (`c0 00 8d 20` → `20 8d 00 c0`). Ou seja:
+///    esta é uma leitura de DADOS de 32 bits sendo devolvida em BIG-ENDIAN quando deveria ser
+///    little-endian. Rastreando `cpsr().isBigEndian()` (`CPSR.E`, bit 9) instrução a instrução:
+///    **`CPSR.E` está `true` bem antes do `LDR`, herdado do contexto interrompido** — e uma sonda
+///    mais ampla (`cpsr.E` amostrado a CADA fatia desde o início do boot) mostra que o bit NÃO fica
+///    preso permanentemente: ele OSCILA entre `true`/`false` repetidas vezes, sempre em modo
+///    `SUPERVISOR`, concentrado num punhado de PCs perto do FIM do `.text` do kernel
+///    (`0xc0a6xxxx`-`0xc0a9xxxx`, plausivelmente a região do laço ocioso/`WFI`/`arch_cpu_idle`,
+///    dado que o kernel tem ~10,8MB de código e essa faixa fica logo depois disso) — a última
+///    virada antes do fault acontece na MESMA fatia (`77273`), no MESMO PC (`0xc0a6603c`) onde o
+///    `servicePendingIrq()` intercepta a CPU e desvia para o vetor de IRQ. `spsr(IRQ)`/
+///    `spsr(SUPERVISOR)`/`spsr(ABORT)` amostrados ao final NÃO mostram `E=1` armazenado (bit 9 = 0
+///    nos três), então a hipótese simples "um SPSR poluído uma vez propaga E=1 para sempre via
+///    `MOVS PC,LR`" não está confirmada — o mecanismo exato de COMO/ONDE `CPSR.E` vira `true` momentos
+///    antes deste `LDR` específico não foi isolado nesta sessão.
+/// 4. **Próximo passo recomendado, concreto**: (a) localizar a PRIMEIRA instrução (não só a
+///    primeira fatia) que escreve `CPSR.E=1` — trace via `step()` teria que cobrir a região
+///    `0xc0a6xxxx`-`0xc0a9xxxx` perto do laço ocioso, correlacionando cada `MSR`/`MOVS PC,Rn`/`RFE`
+///    com o valor de E antes/depois, para achar o `MSR`/retorno de exceção específico que liga o
+///    bit; (b) cross-referenciar contra `arch/arm/kernel/entry-armv.S`/`arch/arm/kernel/process.S`
+///    do `raspberrypi/linux` (árvore documentada em `testdata/raspi1/README.md`) para essa faixa de
+///    endereço — plausivelmente `cpu_v6_do_idle`/`arch_cpu_idle`/`default_idle` ou o próprio
+///    `vector_stub`/`ret_from_intr`, mas isso não foi confirmado ainda; (c) considerar se isto é
+///    causado por um bug real do `arm-jitter` na banked-register/SPSR machinery do
+///    interpretador/JIT nativo (ex.: leitura de SPSR de um banco errado, ou um `MSR` mal decodificado
+///    que seta bit 9 por engano) em vez de comportamento genuíno do kernel — o kernel LE normal não
+///    deveria precisar de `SETEND` nesta fase do boot.
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
@@ -449,12 +519,15 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M2 não fecha nesta sessão: um bug real e independente foi corrigido (SMC/JIT sem "
-            + "invalidação, ver Javadoc da classe) mas a tempestade de abortos pós-kprobes CONTINUA — "
-            + "mesmo endereço-raiz 0x208d00c0 (SECTION_TRANSLATION, DATA_READ) reproduzido "
-            + "identicamente antes e depois do fix, ~77-86 mil fatias após o boot iniciar. Causa raiz "
-            + "não isolada; próximo passo é trace instrução-a-instrução comparado ao oráculo QEMU. Ver "
-            + "Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão: corrigido um bug real de tipagem no arm-jitter "
+            + "(InvalidationAwareAddressSpace não encaminhava fetch16/32/translationGeneration, "
+            + "causando DATA_ABORT em vez de PREFETCH_ABORT numa falha de busca) mas o mesmo "
+            + "endereço-raiz 0x208d00c0 continua faltando (agora corretamente como INSTRUCTION_FETCH) "
+            + "-- 27,5 milhões de reaborts idênticos observados. Causa raiz concreta identificada: um "
+            + "LDR LR,[PC,LR,LSL#2] do vector_stub de IRQ (Rd==Rm) le a tabela de branch em "
+            + "big-endian quando CPSR.E oscila para true perto do laco ocioso, produzindo o alvo de "
+            + "salto invertido em bytes (0xc0008d20 -> 0x208d00c0). Origem exata de CPSR.E=true ainda "
+            + "NAO isolada. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {
