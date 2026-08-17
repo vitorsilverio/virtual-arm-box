@@ -131,6 +131,29 @@ public final class Bcm2835Cp15Extras implements CoprocessorBus {
         delegate.write(coprocessor, opcode1, crn, crm, opcode2, value);
     }
 
+    // ── MCRR/MRRC (F3, sessão de decode) ────────────────────────────────────────
+    // Este decorator não intercepta nenhum registrador de transferência DUPLA — repassa sempre
+    // para o delegate ({@link Cp15VmsaCoprocessor}, que atende `c6` = invalidar D-cache por
+    // faixa). Sem estes 3 overrides, o default de {@link CoprocessorBus#handlesDouble} herdaria
+    // de {@link #handles(int)} (que devolve `true` para QUALQUER coisa em CP15, inclusive
+    // MCRR/MRRC), e os defaults de `readDouble`/`writeDouble` lançariam
+    // `UnsupportedOperationException` em vez de delegar — um bug real, não hipotético, achado ao
+    // implementar o decode nesta sessão.
+    @Override
+    public boolean handlesDouble(int coprocessor, int opcode1, int crm) {
+        return delegate.handlesDouble(coprocessor, opcode1, crm);
+    }
+
+    @Override
+    public long readDouble(int coprocessor, int opcode1, int crm) {
+        return delegate.readDouble(coprocessor, opcode1, crm);
+    }
+
+    @Override
+    public void writeDouble(int coprocessor, int opcode1, int crm, int rt, int rt2) {
+        delegate.writeDouble(coprocessor, opcode1, crm, rt, rt2);
+    }
+
     /// `CRn=0`, `opcode1=0`, **qualquer `CRm`** — o esquema CPUID inteiro do ARMv6+ (ARM DDI
     /// 0100I §B4.1.51 e seguintes), incluindo sub-registradores AINDA não alocados pela
     /// arquitetura na revisão do ARM1176JZF-S. **Achado real (2º, depois de `ID_MMFR0`)**: a

@@ -23,6 +23,7 @@ class Bcm2835Cp15ExtrasTest {
     private static final class RecordingDelegate implements CoprocessorBus {
         boolean readCalled;
         boolean writeCalled;
+        boolean handlesDoubleCalled;
 
         @Override
         public boolean handles(int coprocessor) {
@@ -43,6 +44,12 @@ class Bcm2835Cp15ExtrasTest {
         @Override
         public void write(int coprocessor, int opcode1, int crn, int crm, int opcode2, int value) {
             writeCalled = true;
+        }
+
+        @Override
+        public boolean handlesDouble(int coprocessor, int opcode1, int crm) {
+            handlesDoubleCalled = true;
+            return true;
         }
     }
 
@@ -107,5 +114,18 @@ class Bcm2835Cp15ExtrasTest {
         Bcm2835Cp15Extras extras = new Bcm2835Cp15Extras(delegate);
         extras.write(CP15, 0, 2, 0, 0, 42); // TTBR0, não interceptado.
         assertTrue(delegate.writeCalled, "registrador fora do escopo desta classe deveria ir ao delegate");
+    }
+
+    /// Regressão (F3, sessão de decode `MCRR`/`MRRC`): esta classe não intercepta nenhuma
+    /// transferência DUPLA — precisa repassar `handlesDouble` ao delegate (`Cp15VmsaCoprocessor`
+    /// na cadeia real), senão o default de `CoprocessorBus` (`false`) engole a chamada antes de
+    /// alcançar o `c6` implementado lá. Mesmo achado documentado em `Bcm2835Cp14ExtrasTest`.
+    @Test
+    void doubleTransferHandlesDelegatesThrough() {
+        RecordingDelegate delegate = new RecordingDelegate();
+        Bcm2835Cp15Extras extras = new Bcm2835Cp15Extras(delegate);
+
+        assertTrue(extras.handlesDouble(CP15, 0, 6));
+        assertTrue(delegate.handlesDoubleCalled, "handlesDouble deve ser repassado ao delegate");
     }
 }

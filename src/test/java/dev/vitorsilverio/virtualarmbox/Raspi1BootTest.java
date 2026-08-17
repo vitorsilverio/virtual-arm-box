@@ -16,6 +16,20 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// Aceite da task F3 (`--machine=raspi1`) — ver `tasks/trilha-f-infra/f3-raspi1-machine.md`.
 ///
+/// **ESTADO ATUAL (sessão de decode MCRR/MRRC, 2026-08-17) — leia isto primeiro, o resto do
+/// Javadoc abaixo é histórico cronológico de sessões anteriores.** M1 fechado. M2: o abort storm
+/// de `CPSR.E` (sessão anterior) e o panic de VFS (`FdtPatcher`, sessão anterior) estão
+/// resolvidos; o bloqueio mais recente conhecido era `Oops - undefined instruction` em
+/// `v6_clear_user_highpage_aliasing` por falta de decode de `MCRR`/`MRRC` — CORRIGIDO nesta
+/// sessão (`arm-jitter` decodifica `MCRR`/`MRRC`; achado extra: a cadeia de decorators CP15/CP14
+/// deste host não repassava `handlesDouble`/`readDouble`/`writeDouble`, mascarando o fix mesmo
+/// com testes de unidade verdes — corrigido nos 3 decorators). **Não sabemos se isso fecha M2**:
+/// a re-execução do teste JIT nesta sessão não concluiu em ~40min (JUnit `@Timeout` em modo
+/// `SAME_THREAD` não preempte laço apertado) e foi abortada manualmente — resultado
+/// inconclusivo, não uma falha confirmada. Ver o motivo do `@Disabled` no método
+/// `reachesFreeingKernelMemoryAcceiteM2Jit` para o próximo passo recomendado (harness com
+/// progresso observável em vez do `@Test` cru).
+///
 /// **M1 redefinido (sessão 1/3)**: a mensagem literal do enunciado ("Uncompressing Linux...
 /// done, booting the kernel.") não existe neste `kernel.img` oficial — confirmado rodando o
 /// MESMO `kernel.img`+`.dtb` no `qemu-system-arm -M raspi1ap` (oráculo instalado nesta máquina)
@@ -623,16 +637,19 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M2 não fecha nesta sessão: o fix de linux,initrd-start/end (FdtPatcher, ver Javadoc "
-            + "da classe) FUNCIONOU -- o kernel monta o initramfs e chega a executar '/init' de "
-            + "verdade ('Run /init as init process') -- mas um bloqueio NOVO e bem mais tardio "
-            + "aparece: 'Internal error: Oops - undefined instruction' em "
-            + "v6_clear_user_highpage_aliasing, matando o init ('Attempted to kill init!'). Opcode "
-            + "decodificado nesta sessão: 0xec432f06 = MCRR p15,0,r2,r3,c6 (transferência dupla de "
-            + "registrador para coprocessador) -- provável lacuna de DECODE (não só de dispatch do "
-            + "CoprocessorBus) para MCRR/MRRC no arm-jitter A32, nunca exercitada antes por "
-            + "gbaemu/ndsemu/armbox (nenhum usa CP15 double-register transfer). Não investigado além "
-            + "da decodificação do opcode (fora do orçamento desta sessão). Ver Javadoc da classe.")
+    @Disabled("MCRR/MRRC decodificado e encaminhado pela cadeia de decorators CP15/CP14 nesta "
+            + "sessão (achado real: handlesDouble/readDouble/writeDouble não eram repassados pelos "
+            + "decorators, mascarando o fix de decode no boot real mesmo com testes de unidade "
+            + "verdes). Re-execução deste teste NÃO concluiu nesta sessão: passou de ~40min sem "
+            + "produzir saída (heap JVM ainda crescendo lentamente, não travado) e foi abortada "
+            + "manualmente -- o @Timeout de 30min do JUnit em modo SAME_THREAD não preempte um "
+            + "laço apertado, só reporta falha DEPOIS que o método retorna (mesmo problema já "
+            + "documentado para o INTERPRETED em sessão anterior). Resultado genuinamente "
+            + "desconhecido: não sabemos se o fix fecha M2, se há um bloqueio novo mais tardio, ou "
+            + "se o boot real é só mais lento que 40min neste ponto. Próximo passo recomendado: "
+            + "repetir com um harness temporário com progresso observável (print periódico de PC/"
+            + "console a cada N fatias, como em sessões anteriores) em vez do @Test cru, para não "
+            + "gastar outra rodada às cegas. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {

@@ -22,6 +22,9 @@ class Bcm2835Cp14ExtrasTest {
     private static final class RecordingDelegate implements CoprocessorBus {
         boolean readCalled;
         boolean writeCalled;
+        boolean handlesDoubleCalled;
+        boolean readDoubleCalled;
+        boolean writeDoubleCalled;
 
         @Override
         public boolean handles(int coprocessor) {
@@ -42,6 +45,23 @@ class Bcm2835Cp14ExtrasTest {
         @Override
         public void write(int coprocessor, int opcode1, int crn, int crm, int opcode2, int value) {
             writeCalled = true;
+        }
+
+        @Override
+        public boolean handlesDouble(int coprocessor, int opcode1, int crm) {
+            handlesDoubleCalled = true;
+            return coprocessor == CP15;
+        }
+
+        @Override
+        public long readDouble(int coprocessor, int opcode1, int crm) {
+            readDoubleCalled = true;
+            return 0x5678L;
+        }
+
+        @Override
+        public void writeDouble(int coprocessor, int opcode1, int crm, int rt, int rt2) {
+            writeDoubleCalled = true;
         }
     }
 
@@ -82,5 +102,27 @@ class Bcm2835Cp14ExtrasTest {
 
         cp14.write(CP15, 0, 0, 0, 0, 1);
         assertTrue(delegate.writeCalled, "escrita de CP15 deve ser repassada ao delegate");
+    }
+
+    /// Regressão (F3, sessão de decode `MCRR`/`MRRC`): este decorator é o mais externo da cadeia
+    /// real em `Bcm2835Machine` — sem repassar `handlesDouble`/`readDouble`/`writeDouble` ao
+    /// delegate, o default de `CoprocessorBus` (`false`, que NÃO delega automaticamente) engolia
+    /// toda transferência DUPLA antes de alcançar `Cp15VmsaCoprocessor`, mesmo com o `c6` já
+    /// implementado lá — o boot real continuava recebendo `UNDEFINED` em
+    /// `MCRR p15,0,Rt,Rt2,c6` apesar dos testes unitários isolados de `Cp15VmsaCoprocessor`
+    /// passarem (achado real: só apareceu rodando o kernel de verdade, não em teste de unidade).
+    @Test
+    void doubleTransferTrafficDelegates() {
+        RecordingDelegate delegate = new RecordingDelegate();
+        Bcm2835Cp14Extras cp14 = new Bcm2835Cp14Extras(delegate);
+
+        assertTrue(cp14.handlesDouble(CP15, 0, 6));
+        assertTrue(delegate.handlesDoubleCalled, "handlesDouble deve ser repassado ao delegate");
+
+        assertEquals(0x5678L, cp14.readDouble(CP15, 0, 6));
+        assertTrue(delegate.readDoubleCalled, "readDouble deve ser repassado ao delegate");
+
+        cp14.writeDouble(CP15, 0, 6, 1, 2);
+        assertTrue(delegate.writeDoubleCalled, "writeDouble deve ser repassado ao delegate");
     }
 }

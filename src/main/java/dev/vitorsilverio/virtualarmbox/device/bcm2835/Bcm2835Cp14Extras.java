@@ -68,4 +68,30 @@ public final class Bcm2835Cp14Extras implements CoprocessorBus {
         }
         delegate.write(coprocessor, opcode1, crn, crm, opcode2, value);
     }
+
+    // ── MCRR/MRRC (F3, sessão de decode) ────────────────────────────────────────
+    // Achado real desta sessão: este decorator é o MAIS EXTERNO da cadeia em Bcm2835Machine
+    // (Bcm2835Cp14Extras -> Bcm2835Cp15Extras -> Cp15VmsaCoprocessor) — sem estes 3 overrides,
+    // TODA chamada de transferência DUPLA (mesmo para CP15/c6, já implementada no fim da cadeia)
+    // parava aqui, porque o default de CoprocessorBus#handlesDouble é `false` e NÃO delega
+    // automaticamente (decisão deliberada, ver Javadoc de CoprocessorBus — evita que um bus que só
+    // implementa MCR/MRC reivindique MCRR/MRRC por acidente). Isso mascarou o fix de decode/
+    // Cp15VmsaCoprocessor no boot real: os testes de unidade (que instanciam Cp15VmsaCoprocessor
+    // isolado, sem esta cadeia) passavam, mas o kernel real continuava recebendo UNDEFINED em
+    // MCRR p15,0,Rt,Rt2,c6 porque a chamada nunca alcançava o fim da cadeia. CP14 nunca implementa
+    // nenhum registrador de transferência dupla — sempre repassa para o delegate.
+    @Override
+    public boolean handlesDouble(int coprocessor, int opcode1, int crm) {
+        return delegate.handlesDouble(coprocessor, opcode1, crm);
+    }
+
+    @Override
+    public long readDouble(int coprocessor, int opcode1, int crm) {
+        return delegate.readDouble(coprocessor, opcode1, crm);
+    }
+
+    @Override
+    public void writeDouble(int coprocessor, int opcode1, int crm, int rt, int rt2) {
+        delegate.writeDouble(coprocessor, opcode1, crm, rt, rt2);
+    }
 }

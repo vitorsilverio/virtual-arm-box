@@ -116,4 +116,26 @@ public final class VersatileCp15Extras implements CoprocessorBus {
         // comportamento de antes desta classe existir.
         delegate.write(coprocessor, opcode1, crn, crm, opcode2, value);
     }
+
+    // ── MCRR/MRRC (F3, sessão de decode) ────────────────────────────────────────
+    // Este decorator não intercepta nenhum registrador de transferência DUPLA — repassa sempre
+    // para o delegate ({@link Cp15VmsaCoprocessor}). Sem estes 3 overrides, o default de
+    // {@link CoprocessorBus#handlesDouble} herdaria de {@link #handles(int)} (que devolve `true`
+    // para QUALQUER coisa em CP15, inclusive MCRR/MRRC), e os defaults de `readDouble`/
+    // `writeDouble` lançariam `UnsupportedOperationException` em vez de delegar — mesmo bug real
+    // corrigido em `Bcm2835Cp15Extras`.
+    @Override
+    public boolean handlesDouble(int coprocessor, int opcode1, int crm) {
+        return delegate.handlesDouble(coprocessor, opcode1, crm);
+    }
+
+    @Override
+    public long readDouble(int coprocessor, int opcode1, int crm) {
+        return delegate.readDouble(coprocessor, opcode1, crm);
+    }
+
+    @Override
+    public void writeDouble(int coprocessor, int opcode1, int crm, int rt, int rt2) {
+        delegate.writeDouble(coprocessor, opcode1, crm, rt, rt2);
+    }
 }
