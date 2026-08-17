@@ -19,6 +19,7 @@ import dev.vitorsilverio.virtualarmbox.device.Pl011Uart;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835ArmControlBlock;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Cp14Extras;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Cp15Extras;
+import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Cprman;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Ic;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Mailbox;
 import dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835SystemTimer;
@@ -34,16 +35,68 @@ import java.io.OutputStream;
 /// Mapa de memória e nomes de registrador espelham `include/hw/arm/raspi_platform.h` +
 /// `hw/arm/bcm2835_peripherals.c` do QEMU (oráculo desta task, mesmo padrão de transcrição da
 /// B4.1.5) — só o subconjunto no "Inclui" da task: temporizador de sistema, controlador de
-/// interrupção, mailbox/canal de propriedades (mínimo) e UART0 (console, reaproveitando
-/// {@link Pl011Uart} sem alterá-lo — é o mesmo bloco de IP ARM PrimeCell). GPIO/AUX/DMA/SD/USB/
-/// clock manager (CPRMAN) ficam em {@link OpenBus} — **achado real, não lacuna silenciosa**: um
-/// kernel REAL moderno (`testdata/raspi1/README.md`) só consegue registrar o console "de
-/// verdade" (`ttyAMA0` via o driver `amba`/`pl011`, que exige um `clk` do CPRMAN + pinctrl GPIO
-/// para o `probe()` suceder) depois de todo o subsistema de clock estar presente; sem CPRMAN o
-/// kernel usa `earlycon` (poke direto de MMIO, sem depender de driver nenhum) do começo ao fim
-/// do boot, o que já é suficiente para os marcos M1/M2 desta task mas **bloqueia M3** (sem
-/// `/dev/ttyAMA0` real não há como um `getty` abrir um shell nele) — ver `README.md` desta
-/// classe/task para o que a próxima sessão precisa (CPRMAN mínimo, só o clock do UART).
+/// interrupção, mailbox/canal de propriedades (mínimo), UART0 (console, reaproveitando
+/// {@link Pl011Uart} sem alterá-lo — é o mesmo bloco de IP ARM PrimeCell) e, desde a sessão de
+/// fechamento do M3, {@link Bcm2835Cprman} mínimo. GPIO/AUX/DMA/SD/USB ficam em {@link OpenBus}.
+///
+/// **M3 — achado real via trace de boot (sessão de fechamento)**: a hipótese herdada de sessões
+/// anteriores ("CPRMAN + pinctrl GPIO são necessários para o `probe()` do driver `amba`/`pl011`
+/// suceder") estava **parcialmente errada**: o driver PL011 real já registrava `ttyAMA0` mesmo
+/// sem NENHUM periférico de clock (`"20201000.serial: ttyAMA0 ... is a PL011 rev2"` aparecia no
+/// log mesmo com `OpenBus` no lugar do CPRMAN) — GPIO/pinctrl nunca bloqueou nada, não foi
+/// necessário nenhum stub de GPIO. O bloqueio real era outro: o driver de clock
+/// `drivers/clk/bcm/clk-bcm2835.c` marca `plld` como `CLK_IS_CRITICAL` (preparado
+/// incondicionalmente no `probe()` síncrono, mesmo sem consumidor real) e espera o bit de "PLL
+/// travado" em `CM_LOCK` (`0x114`) ligar; sob `OpenBus` esse bit nunca liga, o driver estoura um
+/// timeout (`"plld: couldn't lock PLL"`/`error -ETIMEDOUT`) e cai no mecanismo de *deferred
+/// probe* do kernel — o `ttyAMA0` real só termina de registrar bem mais tarde, numa `workqueue`
+/// assíncrona, DEPOIS que o PID 1 (`/init`) já abriu `/dev/console` e ficou preso no console
+/// antigo (`earlycon`, que não processa entrada digitada). {@link Bcm2835Cprman} corrige isso
+/// sem modelar PLL algum: `CM_LOCK` sempre reporta "todos os PLLs travados", fazendo o `probe()`
+/// síncrono ter sucesso na primeira tentativa — ver Javadoc daquela classe para o detalhe
+/// completo e por que isso bastou (nenhum GPIO/pinctrl foi implementado).
+///
+/// **M3 ainda NÃO fecha — bloqueio NOVO e DIFERENTE, descoberto DEPOIS do fix do CPRMAN acima**:
+/// com `CM_LOCK` sempre "travado", o log do kernel real confirma que `plld`/`ttyAMA0` registram
+/// sem erro (`ETIMEDOUT`/`couldn't lock PLL` desaparecem por completo) — mas, poucos segundos de
+/// tempo simulado depois de `Run /init as init process`, o console é **inundado por um laço de
+/// nova tentativa aparentemente sem fim** do driver `sdhost-bcm2835`/`mmc0`
+/// (`"mmc0: Card stuck being busy! __mmc_poll_for_busy"` / `"sdhost-bcm2835 20202000.mmc: no
+/// support for card's volts"` / `"mmc0: error -22 whilst initialising SDIO card"`, repetindo a
+/// ~1,2s de tempo simulado por vez, indefinidamente) — comportamento ESPERADO em hardware real
+/// (`mmc_rescan` reagenda a si mesmo procurando por hot-plug de cartão para sempre quando não há
+/// cartão instalado; SD/MMC real está deliberadamente fora do "Inclui" desta task, servido por
+/// `OpenBus` em `0x2020_2000`), mas que aqui **nunca para**, porque {@link Bcm2835SystemTimer}
+/// converte ciclos-de-CPU-emulados em microssegundos numa proporção fixa
+/// (`HOST_CYCLES_PER_MICROSECOND=4`) desacoplada do relógio de parede real — o tempo simulado do
+/// kernel corre bem à frente do tempo real, então o laço de nova tentativa (que seria só um
+/// evento ocasional e barato em hardware real) consome uma fração dominante e crescente do
+/// console e, aparentemente, do tempo de CPU pelo resto do boot. Um harness de diagnóstico
+/// temporário (removido antes do commit, mesmo precedente de sessões anteriores) confirmou que o
+/// console cresce de forma linear e estável (~27 mil caracteres por milhão de fatias, sem
+/// desacelerar) mas que nem o próprio banner do `/init` deste repositório
+/// (`"virtual-arm-box: initramfs busybox pronta"`, um `echo` simples, sem nenhuma dependência de
+/// hardware) nem o prompt do shell (`"/ #"`) apareceram em 20 milhões de fatias (~8 minutos
+/// reais) — não é possível afirmar se o prompt eventualmente aparece dado tempo suficiente (a
+/// extrapolação da taxa observada sugere entre 60-90 minutos reais para os 200 milhões de fatias
+/// do orçamento atual de `Raspi1BootTest#MAX_SLICES`, muito além do que um `@Test` bloqueante
+/// desta sessão conseguiu validar dentro do orçamento de tool-calls).
+///
+/// **Próximo passo recomendado, concreto**: (a) o caminho mais barato é provavelmente
+/// desabilitar o nó `mmc@7e202000` (`sdhost`) no `.dtb` via `status = "disabled"` — o `.dtb` real
+/// já usa essa propriedade em outros nós (confirmado por inspeção de bytes), mas isso exige
+/// estender {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} para SUBSTITUIR uma
+/// propriedade existente por um valor de tamanho DIFERENTE (`"okay\0"` tem 5 bytes, `"disabled
+/// \0"` tem 9) — os métodos atuais (`withBootargs`/`withMemorySize`) só sobrescrevem em tamanho
+/// fixo; `withInitrdRange` só cria propriedades novas, nenhum dos dois serve sem modificação.
+/// Isto NÃO foi implementado nesta sessão (fora do "Inclui" desta task, decisão explícita de
+/// parar e não improvisar); (b) alternativa mais arriscada: revisitar
+/// `HOST_CYCLES_PER_MICROSECOND` para acoplar melhor tempo simulado a tempo real — mas isso é uma
+/// mudança de modelo de tempo mais ampla, com risco de regressão em M1/M2 (calibrados com o valor
+/// atual), não recomendada sem medir o efeito nos dois; (c) confirmar, com um trace mais longo
+/// (fora do orçamento desta sessão), se o prompt realmente aparece dado tempo suficiente — se sim,
+/// talvez baste rodar `Raspi1BootTest`'s M3 num ambiente com mais tempo disponível (CI, não uma
+/// sessão de agente), sem nenhuma mudança de código adicional.
 public final class Bcm2835Machine implements Machine {
     /// RAM do Model B rev 1 (256MiB) — o `.dtb` cru vem com `/memory@0/reg` zerado (achado real,
     /// ver Javadoc de {@link FdtPatcher}); este é o valor que o hospedeiro escreve ali.
@@ -77,6 +130,9 @@ public final class Bcm2835Machine implements Machine {
     /// {@link Bcm2835ArmControlBlock} sobre por que os dois compartilham um único mapeamento.
     private static final int ARM_CONTROL_BLOCK_BASE = 0x2000_B000;
     private static final int UART0_BASE = 0x2020_1000;
+    /// `CPRMAN_OFFSET = 0x101000` em `raspi_platform.h` do QEMU, relativo à base de periféricos
+    /// do Pi 1 (`0x2000_0000`) — ver Javadoc de {@link Bcm2835Cprman}.
+    private static final int CPRMAN_BASE = 0x2010_1000;
 
     /// `raspi_platform.h`: fontes GPU do `Bcm2835Ic` usadas por esta task. Os 4 comparadores do
     /// `Bcm2835SystemTimer` mapeiam 1:1 nas fontes GPU 0-3 (`hw/timer/bcm2835_systmr.c` do QEMU,
@@ -158,6 +214,7 @@ public final class Bcm2835Machine implements Machine {
         physical.mapHandler(ST_BASE, Bcm2835SystemTimer.REGION_SIZE, systemTimer);
         physical.mapHandler(ARM_CONTROL_BLOCK_BASE, Bcm2835ArmControlBlock.REGION_SIZE,
                 new Bcm2835ArmControlBlock(ic, mailbox));
+        physical.mapHandler(CPRMAN_BASE, Bcm2835Cprman.REGION_SIZE, new Bcm2835Cprman());
 
         TranslatingAddressSpace mmu = new TranslatingAddressSpace(physical);
 

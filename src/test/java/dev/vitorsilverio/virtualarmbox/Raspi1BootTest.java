@@ -594,6 +594,28 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// então isso é esperado, não um bug). `mvn -o test` verde no `virtual-arm-box`; nenhum arquivo do
 /// `arm-jitter` tocado nesta sessão (G5 completo não necessário, só o G5 "leve" deste repo).
 ///
+/// **Sessão de fechamento do M3 (CPRMAN, 2026-08-17) — bug real corrigido, M3 ainda NÃO fecha
+/// (bloqueio novo e diferente, fora do escopo desta task)**: implementado
+/// `dev.vitorsilverio.virtualarmbox.device.bcm2835.Bcm2835Cprman` mínimo — um trace de boot
+/// confirmou que, sem NENHUM periférico de clock, o driver `clk-bcm2835` real do kernel esbarra
+/// em `"plld: couldn't lock PLL"` / `error -ETIMEDOUT` (o bit `FLOCKD` de `CM_LOCK` nunca liga sob
+/// `OpenBus`), cai no mecanismo de *deferred probe* e só termina de registrar `ttyAMA0` bem
+/// depois do PID 1 já ter aberto `/dev/console` preso no `earlycon` antigo. `Bcm2835Cprman`
+/// corrige isso fazendo `CM_LOCK` sempre reportar "todos os PLLs travados" (nenhuma matemática de
+/// PLL real, ver Javadoc daquela classe) — confirmado ao vivo: `ETIMEDOUT`/`couldn't lock PLL`
+/// desaparecem do log. **M3 continua NÃO fechando**: um bloqueio novo e diferente aparece pouco
+/// depois de `Run /init as init process` — um laço de nova tentativa aparentemente sem fim do
+/// `sdhost-bcm2835`/`mmc0` (esperado em hardware real, SD/MMC deliberadamente fora do "Inclui"
+/// desta task) que, por causa da compressão agressiva de tempo do
+/// `Bcm2835SystemTimer` (`HOST_CYCLES_PER_MICROSECOND`), nunca cede espaço para o prompt do shell
+/// aparecer dentro do orçamento observável desta sessão (20 milhões de fatias, ~8 minutos reais,
+/// sem sinal do prompt nem do banner do próprio `/init`). Ver Javadoc de
+/// `dev.vitorsilverio.virtualarmbox.Bcm2835Machine` para o achado completo, a extrapolação de
+/// tempo necessário (~60-90 min reais para o orçamento atual de {@link #MAX_SLICES}) e o próximo
+/// passo recomendado (`FdtPatcher` capaz de sobrescrever uma propriedade com tamanho diferente,
+/// para desabilitar o nó `mmc@7e202000` via `status = "disabled"`). `mvn -o test` verde no
+/// `virtual-arm-box`; nenhum arquivo do `arm-jitter` tocado nesta sessão.
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
@@ -675,14 +697,18 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M3 depende de M1/M2 — ver Javadoc da classe.")
+    @Disabled("M3: sessao do CPRMAN fechou o bloqueio de ETIMEDOUT/deferred-probe do ttyAMA0, mas "
+            + "revelou um novo bloqueio (retry infinito de mmc0/sdhost inundando o console) — ver "
+            + "Javadoc de Bcm2835Machine para o achado completo e o proximo passo recomendado.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void bootsToInteractiveBusyboxShellAcceiteM3Interpreted() throws Exception {
         assertReachesInteractiveShell(Bcm2835Machine.Backend.INTERPRETED);
     }
 
-    @Disabled("M3 depende de M1/M2 — ver Javadoc da classe.")
+    @Disabled("M3: sessao do CPRMAN fechou o bloqueio de ETIMEDOUT/deferred-probe do ttyAMA0, mas "
+            + "revelou um novo bloqueio (retry infinito de mmc0/sdhost inundando o console) — ver "
+            + "Javadoc de Bcm2835Machine para o achado completo e o proximo passo recomendado.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void bootsToInteractiveBusyboxShellAcceiteM3Jit() throws Exception {
