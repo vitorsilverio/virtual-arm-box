@@ -16,9 +16,10 @@ import java.util.Deque;
 /// strings** (nomes de propriedade, referenciados por deslocamento a partir do bloco de
 /// estrutura).
 ///
-/// Duas propriedades são reescritas, ambas já existentes em qualquer `.dtb` real do
-/// `raspberrypi/firmware` (este patcher não sabe CRIAR nós/propriedades novos, só sobrescrever
-/// o valor de um já existente):
+/// Três propriedades são escritas. `bootargs`/`memory@0/reg` já existem em qualquer `.dtb` real
+/// do `raspberrypi/firmware` e são só SOBRESCRITAS ({@link #withProperty}); `linux,initrd-start`/
+/// `linux,initrd-end` (via {@link #withInitrdRange}) não existem no `.dtb` cru e precisam ser
+/// CRIADAS ({@link #withNewProperty}) dentro do nó `/chosen` já existente:
 ///
 /// - **`/chosen/bootargs`** — para apontar o console (`console=ttyAMA0` + `earlycon`) e o
 ///   `rdinit`, exatamente como o `AtagsBuilder` faz para o `versatilepb`.
@@ -30,6 +31,12 @@ import java.util.Deque;
 ///   kernel lê "0 bytes de RAM" e não passa da inicialização de zonas de memória — como o host
 ///   aqui **é** o bootloader (a mesma decisão de arquitetura do `versatilepb`), é ele quem tem
 ///   que fazer essa reescrita, não um `start.elf` que não existe neste repo.
+/// - **`/chosen/linux,initrd-start`/`linux,initrd-end`** — achado real da sessão de fechamento
+///   do CPSR.E da F3: ao contrário do protocolo ATAGs do `versatilepb` (`ATAG_INITRD2`), um
+///   kernel com Device Tree só descobre onde o `initramfs.cpio.gz` carregado na RAM está através
+///   destas duas propriedades em `/chosen`. Sem elas, o kernel ignora o initramfs inteiro e, como
+///   a cmdline pede `root=/dev/ram`, tenta montar `/dev/ram` como um dispositivo de bloco
+///   formatado — que não é — e entra em pânico (`VFS: Unable to mount root fs`).
 ///
 /// Como o valor de `bootargs` quase sempre tem tamanho diferente do antigo (mas `reg` sempre
 /// tem o MESMO tamanho — 2 células de 32 bits, endereço+tamanho, confirmado pela inspeção acima
@@ -89,6 +96,32 @@ public final class FdtPatcher {
         return withProperty(dtb, "memory@0", "reg", newValue);
     }
 
+    /// Devolve uma cópia de `dtb` com `/chosen/linux,initrd-start` e `/chosen/linux,initrd-end`
+    /// CRIADAS (não sobrescritas — este `.dtb` não as tem) apontando para o endereço físico onde
+    /// o `initramfs.cpio.gz` foi carregado na RAM. Ver Javadoc da classe sobre por que um kernel
+    /// com Device Tree precisa destas duas propriedades para encontrar o initrd.
+    ///
+    /// @param initrdStartPhysicalAddress endereço físico do primeiro byte do initramfs carregado
+    /// @param initrdEndPhysicalAddress   endereço físico logo APÓS o último byte (start + length)
+    public static byte[] withInitrdRange(byte[] dtb, long initrdStartPhysicalAddress,
+                                          long initrdEndPhysicalAddress) {
+        byte[] withStart = withNewProperty(dtb, "chosen", "linux,initrd-start",
+                singleCell(initrdStartPhysicalAddress));
+        return withNewProperty(withStart, "chosen", "linux,initrd-end",
+                singleCell(initrdEndPhysicalAddress));
+    }
+
+    /// `linux,initrd-start`/`linux,initrd-end` são células únicas de 32 bits nesta árvore (mesmo
+    /// `#address-cells = 1` já confirmado por `/memory@0/reg`, `MEMORY_REG_BYTES`).
+    private static byte[] singleCell(long value) {
+        if (value < 0 || value > 0xFFFF_FFFFL) {
+            throw new IllegalArgumentException("fora do alcance de 32 bits: " + value);
+        }
+        byte[] cell = new byte[Integer.BYTES];
+        writeWord(cell, 0, (int) value);
+        return cell;
+    }
+
     private static byte[] withProperty(byte[] dtb, String nodeName, String propertyName, byte[] newValue) {
         int magic = readWord(dtb, FIELD_MAGIC * Integer.BYTES);
         if (magic != MAGIC) {
@@ -125,6 +158,114 @@ public final class FdtPatcher {
         writeWord(result, FIELD_SIZE_DT_STRUCT * Integer.BYTES, sizeDtStruct + delta);
         writeWord(result, FIELD_OFF_DT_STRINGS * Integer.BYTES, offDtStrings + delta);
         return result;
+    }
+
+    /// Insere uma propriedade NOVA como primeiro filho do nó `nodeName` (diferente de
+    /// {@link #withProperty}, que só sobrescreve o valor de uma propriedade já existente).
+    /// Reaproveita o nome no bloco de strings se `propertyName` já ocorrer lá (ex.: outro nó já
+    /// usa o mesmo nome de propriedade); caso contrário, anexa uma string nova ao final do bloco.
+    /// Assume que o bloco de strings começa exatamente onde o bloco de estrutura termina
+    /// (`off_dt_strings == off_dt_struct + size_dt_struct`), o mesmo layout que
+    /// {@link #withProperty} já presume implicitamente ao propagar `delta` para `off_dt_strings`
+    /// — verdadeiro no `.dtb` real desta task (`FdtPatcherTest#assertHeaderConsistent`).
+    private static byte[] withNewProperty(byte[] dtb, String nodeName, String propertyName, byte[] newValue) {
+        int magic = readWord(dtb, FIELD_MAGIC * Integer.BYTES);
+        if (magic != MAGIC) {
+            throw new IllegalArgumentException(
+                    "não é um FDT válido: magic=0x" + Integer.toHexString(magic));
+        }
+        int offDtStruct = readWord(dtb, FIELD_OFF_DT_STRUCT * Integer.BYTES);
+        int offDtStrings = readWord(dtb, FIELD_OFF_DT_STRINGS * Integer.BYTES);
+        int sizeDtStruct = readWord(dtb, FIELD_SIZE_DT_STRUCT * Integer.BYTES);
+        int sizeDtStrings = readWord(dtb, FIELD_SIZE_DT_STRINGS * Integer.BYTES);
+
+        int insertAt = findNodeBodyStart(dtb, offDtStruct, sizeDtStruct, nodeName);
+
+        int nameoff = findStringOffset(dtb, offDtStrings, sizeDtStrings, propertyName);
+        int stringsDelta = 0;
+        byte[] appendedName = null;
+        if (nameoff < 0) {
+            nameoff = sizeDtStrings;
+            appendedName = (propertyName + "\0").getBytes(StandardCharsets.US_ASCII);
+            stringsDelta = appendedName.length;
+        }
+
+        int len = newValue.length;
+        byte[] propEntry = new byte[3 * Integer.BYTES + alignUp4(len)];
+        writeWord(propEntry, 0, FDT_PROP);
+        writeWord(propEntry, Integer.BYTES, len);
+        writeWord(propEntry, 2 * Integer.BYTES, nameoff);
+        System.arraycopy(newValue, 0, propEntry, 3 * Integer.BYTES, len);
+        int structDelta = propEntry.length;
+
+        byte[] result = new byte[dtb.length + structDelta + stringsDelta];
+        System.arraycopy(dtb, 0, result, 0, insertAt);
+        System.arraycopy(propEntry, 0, result, insertAt, propEntry.length);
+        int restOfStructLength = offDtStrings - insertAt;
+        System.arraycopy(dtb, insertAt, result, insertAt + structDelta, restOfStructLength);
+
+        int newStringsAt = offDtStrings + structDelta;
+        System.arraycopy(dtb, offDtStrings, result, newStringsAt, sizeDtStrings);
+        if (appendedName != null) {
+            System.arraycopy(appendedName, 0, result, newStringsAt + sizeDtStrings, appendedName.length);
+        }
+        int oldStringsEnd = offDtStrings + sizeDtStrings;
+        int newStringsEnd = newStringsAt + sizeDtStrings + stringsDelta;
+        System.arraycopy(dtb, oldStringsEnd, result, newStringsEnd, dtb.length - oldStringsEnd);
+
+        int totalDelta = structDelta + stringsDelta;
+        writeWord(result, FIELD_TOTALSIZE * Integer.BYTES,
+                readWord(dtb, FIELD_TOTALSIZE * Integer.BYTES) + totalDelta);
+        writeWord(result, FIELD_SIZE_DT_STRUCT * Integer.BYTES, sizeDtStruct + structDelta);
+        writeWord(result, FIELD_OFF_DT_STRINGS * Integer.BYTES, offDtStrings + structDelta);
+        writeWord(result, FIELD_SIZE_DT_STRINGS * Integer.BYTES, sizeDtStrings + stringsDelta);
+        return result;
+    }
+
+    /// @return o deslocamento logo após o token `FDT_BEGIN_NODE`+nome de `nodeName` — onde o
+    ///         PRIMEIRO filho (propriedade ou sub-nó) do nó começaria.
+    private static int findNodeBodyStart(byte[] dtb, int offDtStruct, int sizeDtStruct, String nodeName) {
+        int cursor = offDtStruct;
+        int end = offDtStruct + sizeDtStruct;
+        while (cursor < end) {
+            int token = readWord(dtb, cursor);
+            switch (token) {
+                case FDT_BEGIN_NODE -> {
+                    int nameLength = nulTerminatedLength(dtb, cursor + Integer.BYTES);
+                    String name = readNulTerminatedString(dtb, cursor + Integer.BYTES);
+                    int bodyStart = cursor + Integer.BYTES + alignUp4(nameLength + 1);
+                    if (name.equals(nodeName)) {
+                        return bodyStart;
+                    }
+                    cursor = bodyStart;
+                }
+                case FDT_END_NODE -> cursor += Integer.BYTES;
+                case FDT_NOP -> cursor += Integer.BYTES;
+                case FDT_PROP -> {
+                    int len = readWord(dtb, cursor + Integer.BYTES);
+                    cursor += 3 * Integer.BYTES + alignUp4(len);
+                }
+                case FDT_END -> cursor = end;
+                default -> throw new IllegalArgumentException(
+                        "token de FDT desconhecido 0x" + Integer.toHexString(token)
+                                + " no deslocamento " + cursor);
+            }
+        }
+        throw new IllegalArgumentException("nó '" + nodeName + "' não encontrado no FDT");
+    }
+
+    /// @return o deslocamento de `name` dentro do bloco de strings, ou -1 se ainda não ocorrer lá.
+    private static int findStringOffset(byte[] dtb, int offDtStrings, int sizeDtStrings, String name) {
+        int end = offDtStrings + sizeDtStrings;
+        int cursor = offDtStrings;
+        while (cursor < end) {
+            int length = nulTerminatedLength(dtb, cursor);
+            if (readNulTerminatedString(dtb, cursor).equals(name)) {
+                return cursor - offDtStrings;
+            }
+            cursor += length + 1;
+        }
+        return -1;
     }
 
     /// Varre o bloco de estrutura (rastreando o nó ATUAL numa pilha, já que `reg`/outros nomes

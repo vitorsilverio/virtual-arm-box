@@ -193,7 +193,10 @@ public final class Bcm2835Machine implements Machine {
         loadBytes(physical, INITRD_LOAD_ADDR, initramfs);
         int dtbAddress = alignUp(INITRD_LOAD_ADDR + initramfs.length, DTB_ALIGNMENT);
 
-        byte[] patchedDtb = FdtPatcher.withMemorySize(FdtPatcher.withBootargs(dtb, cmdline), RAM_SIZE_BYTES);
+        byte[] dtbWithBootargsAndMemory =
+                FdtPatcher.withMemorySize(FdtPatcher.withBootargs(dtb, cmdline), RAM_SIZE_BYTES);
+        byte[] patchedDtb = FdtPatcher.withInitrdRange(
+                dtbWithBootargsAndMemory, INITRD_LOAD_ADDR, INITRD_LOAD_ADDR + initramfs.length);
         loadBytes(physical, dtbAddress, patchedDtb);
 
         core.configureExecutionState(

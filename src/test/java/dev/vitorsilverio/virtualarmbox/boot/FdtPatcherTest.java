@@ -78,6 +78,42 @@ class FdtPatcherTest {
     }
 
     @Test
+    void createsInitrdRangePropertiesThatDoNotExistYet() throws IOException {
+        assumeTrue(Files.exists(DTB), "asset real ausente nesta checkout");
+        byte[] original = Files.readAllBytes(DTB);
+        long start = 0x1000_0000L;
+        long end = 0x1010_0000L;
+
+        byte[] patched = FdtPatcher.withInitrdRange(original, start, end);
+
+        assertHeaderConsistent(patched);
+        byte[] expectedStart = {0x10, 0, 0, 0};
+        byte[] expectedEnd = {0x10, 0x10, 0, 0};
+        assertTrue(indexOf(patched, expectedStart) >= 0, "linux,initrd-start não encontrado no blob");
+        assertTrue(indexOf(patched, expectedEnd) >= 0, "linux,initrd-end não encontrado no blob");
+        assertContainsAsciiOnce(patched, "linux,initrd-start\0");
+        assertContainsAsciiOnce(patched, "linux,initrd-end\0");
+        assertTrue(patched.length > original.length,
+                "propriedades novas devem crescer o blob (nada foi sobrescrito)");
+    }
+
+    @Test
+    void composesWithBootargsAndMemorySizePatches() throws IOException {
+        assumeTrue(Files.exists(DTB), "asset real ausente nesta checkout");
+        byte[] original = Files.readAllBytes(DTB);
+        String cmdline = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
+
+        byte[] patched = FdtPatcher.withInitrdRange(
+                FdtPatcher.withMemorySize(FdtPatcher.withBootargs(original, cmdline), 128L * 1024 * 1024),
+                0x1000_0000L, 0x1010_0000L);
+
+        assertHeaderConsistent(patched);
+        assertContainsAsciiOnce(patched, cmdline + "\0");
+        assertContainsAsciiOnce(patched, "linux,initrd-start\0");
+        assertContainsAsciiOnce(patched, "linux,initrd-end\0");
+    }
+
+    @Test
     void rejectsInvalidMagic() {
         byte[] garbage = new byte[64];
         assertThrows(IllegalArgumentException.class, () -> FdtPatcher.withBootargs(garbage, "x"));

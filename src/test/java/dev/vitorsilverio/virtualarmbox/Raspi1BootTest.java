@@ -508,6 +508,54 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 ///    nem chegou a ser re-executado nesta sessão, mas deve se beneficiar do mesmo fix de CPSR.E —
 ///    a causa raiz é comum aos dois motores).
 ///
+/// **Sessão de extensão do `FdtPatcher` (2026-08-17) — `/chosen/linux,initrd-start`/`linux,initrd-
+/// end` implementados, M2 ainda NÃO fecha (bloqueio novo, bem mais tardio, causa raiz NARROWED a
+/// um opcode específico)**:
+///
+/// 1. Seguindo o próximo passo recomendado pela sessão anterior:
+///    {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher} ganhou
+///    {@link dev.vitorsilverio.virtualarmbox.boot.FdtPatcher#withInitrdRange} — diferente de
+///    {@code withBootargs}/{@code withMemorySize} (que só SOBRESCREVEM propriedades já
+///    existentes), este cria propriedades NOVAS dentro do nó `/chosen` já existente (o `.dtb` cru
+///    não tem `linux,initrd-start`/`linux,initrd-end`). {@link Bcm2835Machine#create} passa a
+///    aplicar o patch com `INITRD_LOAD_ADDR`/`INITRD_LOAD_ADDR + initramfs.length`.
+/// 2. **Efeito confirmado no boot JIT**: o `Kernel panic - VFS: Unable to mount root fs` desta
+///    sessão anterior desaparece por completo. O kernel monta o initramfs e chega a executar
+///    `/init` de verdade (`Run /init as init process` aparece no console, ~8 minutos reais de
+///    corrida) — o mais longe que este repositório já chegou no boot do raspi1.
+/// 3. **M2 ainda NÃO fecha — bloqueio NOVO, mais tardio que qualquer um anterior**: logo depois de
+///    `Run /init as init process`, `Internal error: Oops - undefined instruction` em
+///    `v6_clear_user_highpage_aliasing+0x58/0x104`, chamado por `handle_mm_fault` ao tratar uma
+///    falta de página do `execve()` do `/init` — o processo `init` morre (`Kernel panic - not
+///    syncing: Attempted to kill init!`). Opcode faltoso decodificado a partir do dump de `Code:`
+///    no Oops (`ec432f06`): `MCRR p15,0,r2,r3,c6` (encoding A1 padrão de `MCRR`/`MRRC`, cond=AL,
+///    L=0 → MCRR, Rt2=r3, Rt=r2, coproc=p15, opc1=0, CRm=c6) — uma transferência DUPLA de
+///    registrador para coprocessador, arquiteturalmente diferente do `MCR`/`MRC` de registrador
+///    único que {@code Cp15VmsaCoprocessor}/{@code Bcm2835Cp15Extras} já tratam. Provável lacuna de
+///    DECODE no `arm-jitter` A32 (não só de despacho do `CoprocessorBus`) — nem gbaemu (ARMv4T),
+///    nem ndsemu (ARMv5TE), nem armbox (user-mode) jamais exercitaram `MCRR`/`MRRC`, então esta
+///    seria a primeira vez. **Não investigado além da decodificação do opcode** (fora do orçamento
+///    desta sessão).
+/// 4. **Achado colateral, não fatal, registrado para referência**: bem antes do Oops de `init`, o
+///    log mostra duas ocorrências de `Division by zero in kernel` em `pl011_set_termios` (via
+///    `uart_update_timeout`/`div64_u64`) ao abrir `/dev/console` — o kernel trata como exceção não
+///    fatal e o boot continua (`sdhost-bcm2835`/`raspberrypi-firmware` seguem normalmente logo
+///    depois). Possível causa: algum campo de clock/baud que o `Pl011Uart`/mailbox devolve como 0
+///    onde o driver espera um divisor não-zero — não investigado, só observado.
+/// 5. **Próximo passo recomendado**: (a) confirmar no decoder A32 do `arm-jitter`
+///    (`ArmDecoder`/`decoder/`) se `MCRR`/`MRRC` têm case próprio ou caem em `unsupported`/UNDEFINED
+///    por ausência de decode (mais provável, dado que nenhum consumidor os exercitou); se for
+///    lacuna de decode, é uma task nova do `arm-jitter` (fora do "Não inclui" desta task — mudança
+///    de decoder não é "bug real" no sentido estrito, é FEATURE faltando, mas o precedente de
+///    B1.8/BE8 já tratou uma feature faltando de escopo similar como bloqueio de F3 justificável);
+///    (b) só depois de MCRR/MRRC decodificarem, repetir o boot e ver se `execve("/init")` conclui;
+///    (c) investigar a divisão por zero do PL011 se ela voltar a aparecer de forma fatal (por ora
+///    é só um achado colateral não-bloqueante). Backend INTERPRETED não foi re-executado nesta
+///    sessão (orçamento).
+/// 6. `mvn -o test` verde no `virtual-arm-box` (68 testes, 4 skipped = M2×2+M3×2, motivo do
+///    `@Disabled` atualizado); `VersatilePbBootTest` continua verde. Nenhum arquivo do `arm-jitter`
+///    tocado nesta sessão.
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
@@ -565,27 +613,26 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("M2 não fecha nesta sessão: o bug do CPSR.E (ver sessão de fechamento da classe) foi "
-            + "corrigido no arm-jitter e validado no backend JIT, mas o backend INTERPRETED não foi "
-            + "re-executado (orçamento da sessão) -- deve se beneficiar do mesmo fix, já que a causa "
-            + "raiz é no ArmCore/AProfileExceptionModel, comum aos dois motores. Ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão: o fix de linux,initrd-start/end (ver Javadoc da classe) "
+            + "foi validado só no backend JIT -- o INTERPRETED não foi re-executado (orçamento da "
+            + "sessão), deve se beneficiar do mesmo fix (FdtPatcher é comum aos dois motores). Ver "
+            + "Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Interpreted() throws Exception {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M2 não fecha nesta sessão: o bug do CPSR.E (achado principal desta sessão, ver "
-            + "Javadoc da classe) foi CORRIGIDO -- o abort storm desapareceu por completo e o boot "
-            + "avança MUITO além do ponto anterior (mailbox/USB/mmc0 inicializam, kernel tenta montar "
-            + "root) -- mas um bloqueio NOVO e mais tardio aparece: 'Kernel panic - VFS: Unable to "
-            + "mount root fs on \"/dev/ram\"'. Causa raiz já identificada (não corrigida ainda): o "
-            + "FdtPatcher não escreve '/chosen/linux,initrd-start'/'linux,initrd-end' no DTB, então o "
-            + "kernel nunca aprende onde o initramfs carregado na RAM está -- ele tenta montar "
-            + "'/dev/ram' como um dispositivo de bloco formatado (que não é) em vez de descompactar o "
-            + "cpio como initramfs. Precisa estender o FdtPatcher para CRIAR propriedades novas (hoje "
-            + "só sobrescreve as existentes, ver Javadoc de FdtPatcher) -- fora do orçamento desta "
-            + "sessão. Ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão: o fix de linux,initrd-start/end (FdtPatcher, ver Javadoc "
+            + "da classe) FUNCIONOU -- o kernel monta o initramfs e chega a executar '/init' de "
+            + "verdade ('Run /init as init process') -- mas um bloqueio NOVO e bem mais tardio "
+            + "aparece: 'Internal error: Oops - undefined instruction' em "
+            + "v6_clear_user_highpage_aliasing, matando o init ('Attempted to kill init!'). Opcode "
+            + "decodificado nesta sessão: 0xec432f06 = MCRR p15,0,r2,r3,c6 (transferência dupla de "
+            + "registrador para coprocessador) -- provável lacuna de DECODE (não só de dispatch do "
+            + "CoprocessorBus) para MCRR/MRRC no arm-jitter A32, nunca exercitada antes por "
+            + "gbaemu/ndsemu/armbox (nenhum usa CP15 double-register transfer). Não investigado além "
+            + "da decodificação do opcode (fora do orçamento desta sessão). Ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {
