@@ -6,6 +6,8 @@ import dev.vitorsilverio.armjitter.core.CpuMode;
 import dev.vitorsilverio.armjitter.decoder.InstructionSet;
 import dev.vitorsilverio.armjitter.jit.JitRuntime;
 import dev.vitorsilverio.armjitter.jit.JitRuntimeFactory;
+import dev.vitorsilverio.armjitter.memory.AddressSpace;
+import dev.vitorsilverio.armjitter.memory.InvalidationAwareAddressSpace;
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.armjitter.memory.mmu.Cp15VmsaCoprocessor;
 import dev.vitorsilverio.armjitter.memory.mmu.TranslatingAddressSpace;
@@ -168,7 +170,18 @@ public final class Bcm2835Machine implements Machine {
                     JitRuntimeFactory.divergenceCheckingArmThumb(BLOCK_CACHE_ENTRIES, HOT_THRESHOLD, architecture);
         };
 
-        ArmCore core = new ArmCore(mmu, SwiDispatcher.empty(), architecture);
+        // Achado real (sessão de investigação do silêncio pós-`kprobes:`): sem este decorador, uma
+        // escrita do guest em uma página com código JIT já compilado (ex.: o "self-test" de
+        // kprobes armando um breakpoint otimizado logo após "kprobe jump-optimization is
+        // enabled") nunca invalidava o bloco em cache — o core continuava executando bytecode
+        // JIT compilado a partir do código ANTIGO, divergindo do que o kernel real acabou de
+        // escrever ali. Mesmo padrão já usado por `GbaConsole`/`Armbox` (`InvalidationAwareAddressSpace`
+        // envolvendo o barramento que o `ArmCore` enxerga) — aqui envolve o `mmu` (não o `physical`
+        // por baixo dele) porque blocos JIT são indexados pelo PC VIRTUAL que o core busca, o
+        // mesmo espaço de endereço que `TranslatingAddressSpace#write32` recebe.
+        AddressSpace jitAwareBus = new InvalidationAwareAddressSpace(mmu, runtime);
+
+        ArmCore core = new ArmCore(jitAwareBus, SwiDispatcher.empty(), architecture);
         Cp15VmsaCoprocessor cp15 = new Cp15VmsaCoprocessor(mmu, core);
         core.setCoprocessorBus(new Bcm2835Cp14Extras(new Bcm2835Cp15Extras(cp15)));
         core.setMemoryAbortListener(cp15);

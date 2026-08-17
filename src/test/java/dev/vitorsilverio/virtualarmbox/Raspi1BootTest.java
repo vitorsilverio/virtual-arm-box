@@ -333,6 +333,54 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 ///    deveriam aparecer logo depois de `kprobes:` no boot real, e o que ele faz de diferente nesse
 ///    trecho, é o próximo passo mais barato antes de qualquer trace de instrução.
 ///
+/// **Sessão de investigação do silêncio pós-`kprobes:` (2026-08-16) — hipótese de WFI/mailbox
+/// DESCARTADA, achado real e independente CORRIGIDO (SMC/JIT), causa raiz do bloqueio principal
+/// ainda NÃO isolada**:
+///
+/// 1. **A hipótese "WFI sem IRQ" estava errada**: instrumentando `ArmCore#setTraceListener` com um
+///    `onMemoryAbort` (o mesmo gancho da task `E2`, que dispara sob `runBlocks`/JIT) mostrou que a
+///    CPU NÃO fica parada — ela entra num LAÇO DE ABORTOS (`SECTION_TRANSLATION`) logo depois de
+///    `kprobes:`, silencioso porque nenhum handler de kernel chega a rodar `printk`/`die()` antes
+///    de reabortar. `sleepState()` nunca fica `HALTED`; `mode()` alterna `SUPERVISOR`↔`ABORT` e
+///    `cpsr().irqDisabled()` fica travado em `true` (consistente com estar sempre dentro do
+///    caminho de exceção). A hipótese de mailbox sem resposta também não se sustenta: só 3
+///    requisições `raspberrypi-firmware` acontecem no log ANTES do ponto de travamento, nenhuma
+///    depois — o kernel não está esperando uma 4ª tag, está preso no laço de abortos.
+/// 2. **Achado real e independente CORRIGIDO** (`virtual-arm-box`, não `arm-jitter`):
+///    {@link Bcm2835Machine#create} nunca envolvia o barramento do `ArmCore` em
+///    `InvalidationAwareAddressSpace` — o MESMO decorador que `GbaConsole`/`Armbox` já usam
+///    (`gba-game-compat.md`: bug histórico idêntico no gbaemu, "CPU class" de jogos que constroem
+///    código na pilha). Sem ele, uma escrita do guest numa página com bloco JIT já compilado nunca
+///    invalidava o cache — o core continuava executando bytecode compilado a partir do código
+///    ANTIGO. `kprobes: kprobe jump-optimization` é a PRIMEIRA vez que este repositório exercita
+///    código de guest automodificável (o self-test de kprobes arma um breakpoint otimizado logo
+///    depois dessa mensagem) — {@link VersatilePbMachine} tem a MESMA lacuna, nunca exercitada
+///    porque userspace busybox não se automodifica; não corrigida nesta sessão (fora do escopo da
+///    F3, ver Javadoc de {@link Bcm2835Machine#create} para o achado completo).
+/// 3. **O fix acima NÃO fecha M2 sozinho**: com `InvalidationAwareAddressSpace` no lugar, o MESMO
+///    endereço-raiz de abort — `0x208d00c0`, `SECTION_TRANSLATION`, `DATA_READ` — reaparece
+///    IDENTICO antes e depois do fix (comparação direta, mesmo kernel/dtb/cmdline), só a fatia
+///    exata muda (~86460 sem o fix, ~77273 com o fix — esperado, o fix altera timing de
+///    recompilação JIT mas não a lógica). Isso indica fortemente que é a MESMA causa raiz
+///    pré-existente nos dois casos, não uma regressão introduzida pelo fix. `r14`/LR no momento do
+///    primeiro abort (`0xc0337b50`) é um endereço de `.text` do kernel plausível — a instrução
+///    CHAMADORA é código real; o valor lido/desreferenciado (`0x208d00c0`) é que não bate com
+///    nenhum dos registradores `r0-r13` capturados no momento da falta (não é uma cópia direta de
+///    registrador, precisa vir de um deslocamento/tabela). O segundo endereço (para onde o
+///    handler tenta retornar/reler, ficando preso) MUDA entre execuções (`0x608e00c0` numa rodada,
+///    `0xa08c00c0` noutra) — sugere que a fixup do abort depende de algo que varia por
+///    execução (ex.: o contador livre do `Bcm2835SystemTimer`), não é puramente determinístico.
+/// 4. **Próximo passo recomendado**: trace instrução-a-instrução (`Bcm2835Machine.Backend
+///    .INTERPRETED` + `ArmCore#step()`, não `runBlocks`) a partir de ~70 mil instruções depois do
+///    boot para capturar a instrução EXATA (opcode, não só PC) que produz `0x208d00c0` a partir de
+///    `LR=0xc0337b50` — provavelmente um `LDR` com deslocamento/indexado a partir de uma tabela ou
+///    lista cujo conteúdo está corrompido (fonte ainda desconhecida: pode ser um bug real de
+///    decodificação/execução do `arm-jitter` em alguma instrução ainda não exercitada por
+///    gbaemu/ndsemu, já que este é o primeiro kernel Linux de sistema real sob `ARM11_MPCORE`).
+///    Comparar contra o oráculo QEMU (registrador a registrador via monitor HMP, mesma técnica já
+///    usada para o bug de `SCTLR`/`CR_XP`) no mesmo ponto do boot é o próximo passo mais barato
+///    antes de instrumentar mais.
+///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
 class Raspi1BootTest {
@@ -401,10 +449,12 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M2 não fecha nesta sessão: o Oops de vfp_enable() foi RESOLVIDO (CPACR implementado "
-            + "no arm-jitter), mas o boot em JIT trava logo depois -- último log real: 'kprobes: "
-            + "kprobe jump-optimization is enabled' (kernel time 3.465s) -- 27,9 milhões de fatias "
-            + "seguintes (~18min reais) sem NENHUM byte novo de console. Ver Javadoc da classe.")
+    @Disabled("M2 não fecha nesta sessão: um bug real e independente foi corrigido (SMC/JIT sem "
+            + "invalidação, ver Javadoc da classe) mas a tempestade de abortos pós-kprobes CONTINUA — "
+            + "mesmo endereço-raiz 0x208d00c0 (SECTION_TRANSLATION, DATA_READ) reproduzido "
+            + "identicamente antes e depois do fix, ~77-86 mil fatias após o boot iniciar. Causa raiz "
+            + "não isolada; próximo passo é trace instrução-a-instrução comparado ao oráculo QEMU. Ver "
+            + "Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {
