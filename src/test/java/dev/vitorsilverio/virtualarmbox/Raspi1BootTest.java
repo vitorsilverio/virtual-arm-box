@@ -285,12 +285,53 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// JIT já deu um resultado definitivo e muito mais barato, o interpretado fica para quando alguém
 /// precisar — não é um requisito do aceite rodar até o fim fora do orçamento de uma sessão.
 ///
-/// **Próximo passo recomendado**: identificar a instrução exata que dispara o `UNDEFINED` em
-/// `vfp_enable()` (provavelmente `VMSR FPEXC,Rt` ou uma leitura de `FPEXC`/`FPSID` via `VMRS`) —
-/// usar o mesmo trace instrução-a-instrução desta sessão, agora mirando o PC exato do Oops
-/// (`vfp_enable+0x8`); comparar contra o oráculo QEMU 8.0.0 (`-M raspi1ap`) para confirmar se é
-/// falta de suporte do coprocessador CP10/CP11 (VFP) nesse ponto do boot ou uma feature de
-/// VFPv2/ARM11 genuinamente não modelada pelo `arm-jitter`.
+/// **Próximo passo recomendado (a sessão anterior)**: identificar a instrução exata que dispara o
+/// `UNDEFINED` em `vfp_enable()`.
+///
+/// **Sessão de investigação do Oops em `vfp_enable` (2026-08-16) — causa raiz ISOLADA E CORRIGIDA
+/// (bug real do `arm-jitter`, DIFERENTE do palpite da sessão anterior), M2 ainda NÃO fecha
+/// (bloqueio novo e mais tardio revelado logo depois)**:
+///
+/// 1. **A hipótese anterior estava errada**: `vfp_enable()` (`arch/arm/vfp/vfpmodule.c` do kernel
+///    real, confirmado lendo o fonte) NÃO toca em `FPEXC`/`FPSID` (registradores VFP, CP10/CP11) —
+///    ela é `on_each_cpu(vfp_enable, ...)`, chamada incondicionalmente em ARMv6+ **antes** da sonda
+///    de `FPSID`, e o próprio corpo só faz `get_copro_access()`/`set_copro_access()`, isto é,
+///    `MRC`/`MCR p15,0,Rt,c1,c0,2` — o **`CPACR`** (Coprocessor Access Control Register, CP15, NÃO
+///    CP10/11), concedendo acesso pleno a CP10/CP11 antes de qualquer instrução VFP rodar.
+/// 2. **Causa raiz real**: {@link dev.vitorsilverio.armjitter.memory.mmu.Cp15VmsaCoprocessor}
+///    (`arm-jitter`) nunca reivindicava `c1,c0,2` (só `c1,c0,0`/`SCTLR`) — a leitura/escrita de
+///    `CPACR` caía em `unsupported()` (UNDEFINED), exatamente o `Oops - undefined instruction` em
+///    `vfp_enable+0x8` observado. **Corrigido no `arm-jitter`** (`Cp15VmsaCoprocessor`, ver Javadoc
+///    daquela classe): `CPACR` agora é armazenamento simples (round-trip, sem enforcement de trap —
+///    mesma decisão de escopo do `c7`), com teste de regressão
+///    (`cpacrIsStoredAndReadBackWithoutTrapEnforcement`). `mvn -o test` verde no `arm-jitter` (1364
+///    core+truffle) + `mvn -o install`; G5 revalidado (gbaemu verde, ndsemu verde, armbox verde).
+/// 3. **Confirmado ao vivo via harness diagnóstico temporário** (loop de fatias com impressão
+///    periódica do console, removido antes do commit, mesmo precedente de sessões anteriores): com
+///    o fix, `VFP support v0.3: not present` agora aparece LIMPO (sem Oops) e o boot continua bem
+///    além do ponto anterior — `Setting up static identity map`, `devtmpfs: initialized`,
+///    `hw-breakpoint: debug architecture 0x0 unsupported`, `Serial: AMBA PL011 UART driver`,
+///    `bcm2835-mbox 2000b880.mailbox: mailbox enabled`, 3 requisições `raspberrypi-firmware`
+///    respondidas com sucesso (`status 0x00000000`), `kprobes: kprobe jump-optimization is
+///    enabled` — tudo isso em menos de 4 SEGUNDOS de tempo simulado do kernel (`kernel
+///    time=3.465s`) e ~4 segundos reais/100 mil fatias.
+/// 4. **M2 ainda NÃO fecha — bloqueio NOVO, mais tardio no boot**: depois de
+///    `kprobes: kprobe jump-optimization is enabled`, o console para de crescer por completo —
+///    **27,9 milhões de fatias seguintes (~18 minutos reais) sem NENHUM byte novo**, nem Oops nem
+///    panic (não é um crash observável, é uma ausência total de progresso). Nenhuma hipótese de
+///    causa raiz foi investigada ainda nesta sessão (orçamento esgotado depois do fix do CPACR).
+///    **Próximo passo recomendado**: repetir a técnica desta sessão e das anteriores (trace
+///    instrução-a-instrução via `ArmCore#step()`, ou o gancho `ArmTraceListener` da task `E2`) a
+///    partir do ponto exato onde o console para de crescer, para identificar se a CPU está presa
+///    num `WFI` sem IRQ chegando (suspeita nº1, dado o precedente da "tempestade de IRQ" já
+///    corrigida — mas desta vez talvez FALTA de entrega, não excesso), num laço de espera de
+///    resposta de mailbox/`raspberrypi-firmware` que nunca responde a alguma tag específica ainda
+///    não implementada (ver "Não inclui"/mailbox da spec — o log mostra só 3 tags respondidas antes
+///    de travar, pode haver uma 4ª tag que o kernel espera e nosso `Bcm2835Mailbox` simplesmente
+///    ignora sem sinalizar erro nem responder), ou outra causa ainda não cogitada. Comparar contra
+///    o oráculo QEMU 8.0.0 (mesmo kernel+DTB+initramfs+cmdline) para ver quais linhas de log
+///    deveriam aparecer logo depois de `kprobes:` no boot real, e o que ele faz de diferente nesse
+///    trecho, é o próximo passo mais barato antes de qualquer trace de instrução.
 ///
 /// {@link #smokeTestBootsWithoutException()} prova que a infraestrutura desta task
 /// (CP15/CP14/MMU/periféricos/`FdtPatcher`/`ZImageDecompressor`/handoff) está correta hoje.
@@ -360,8 +401,10 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M2 não fecha nesta sessão — mesmo motivo da versão INTERPRETED, ver Javadoc da classe. "
-            + "Rodada real em JIT (14:43min) confirmou o Oops de vfp_enable() como o bloqueio atual.")
+    @Disabled("M2 não fecha nesta sessão: o Oops de vfp_enable() foi RESOLVIDO (CPACR implementado "
+            + "no arm-jitter), mas o boot em JIT trava logo depois -- último log real: 'kprobes: "
+            + "kprobe jump-optimization is enabled' (kernel time 3.465s) -- 27,9 milhões de fatias "
+            + "seguintes (~18min reais) sem NENHUM byte novo de console. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryAcceiteM2Jit() throws Exception {
