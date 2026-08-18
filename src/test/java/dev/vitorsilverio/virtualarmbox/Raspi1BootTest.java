@@ -16,8 +16,68 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// Aceite da task F3 (`--machine=raspi1`) — ver `tasks/trilha-f-infra/f3-raspi1-machine.md`.
 ///
-/// **ESTADO ATUAL (sessão de trace instrução-a-instrução do loop, 2026-08-18 (2)) — leia isto
-/// primeiro, o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+/// **ESTADO ATUAL (sessão de inspeção de memória do loop, 2026-08-18 (3)) — leia isto primeiro,
+/// o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+///
+/// Seguindo o passo (b) recomendado pela sessão anterior — inspecionar CONTEÚDO DE MEMÓRIA, não só
+/// registradores, em `[r6]=[0x0014622d]` e na palavra de contagem do `rw_semaphore`
+/// (`[0xc1558c2c]`) — o mesmo harness de duas fases (fast-forward JIT + `ArmCore#step()`) foi
+/// reexecutado com um orçamento de fatias bem maior (`STALL_THRESHOLD` de 3.000.000 de fatias sem
+/// crescimento do console, em vez de parar cedo) para dar mais chance ao boot de progredir sozinho
+/// antes de declarar travamento. Dois achados novos:
+///
+/// 1. **O console PROGRIDE mais do que qualquer sessão anterior documentou antes de estagnar de
+///    vez**: depois do já conhecido "silêncio" pós-`Run /init as init process` (kernel time
+///    `482.42`s), esta corrida viu o log continuar em `699.77`s com
+///    `thermal thermal_zone0: Unable to get temperature, disabling!` /
+///    `Disabled thermal zone with critical trip point` — mensagens NUNCA vistas antes nesta task.
+///    Ou seja, o "silêncio" documentado em sessões anteriores não é um travamento naquele ponto
+///    exato: o boot continua avançando (bem mais devagar, ~217s de tempo de kernel sem nenhuma
+///    linha nova), só trava de vez MAIS TARDE, no loop de 157 instruções já conhecido
+///    (`0xc05b1750`-`0xc05b18c4`) — o crescimento do console parou definitivamente em
+///    `slice=3.200.000` e não voltou até `slice=6.400.000` (limite de estagnação atingido), ponto
+///    em que o trace por `step()` confirmou estar exatamente naquele loop.
+/// 2. **Memória CONFIRMADA estática, não só registradores** (12 períodos consecutivos, 1805 passos
+///    de `step()`, período de exatamente 157 passos — mesma cadência já medida): tanto
+///    `[0x0014622d]` (o próprio endereço-alvo do `strb r4,[r6],#0` de prova) quanto
+///    `[0xc1558c2c]` (a palavra de contagem do `rw_semaphore`) permanecem **bit-a-bit idênticos**
+///    em TODOS os 12 períodos — `0x00002d00` e `0x00000100` respectivamente, sem nenhuma variação.
+///    Isso fecha a lacuna que a sessão anterior deixou aberta: não há progresso invisível em
+///    nenhuma das duas memórias vigiadas — o "byte de prova" nunca muda o que está escrito ali (é
+///    coerente com o offset `#0` do `strb` pós-indexado: por decodificação, esta instrução NUNCA
+///    poderia avançar `r6` sozinha, então "escrita idêntica sempre" é o comportamento correto
+///    dela, não um bug) e a contagem do `rw_semaphore` fica travada em `0x100` = exatamente **UM
+///    leitor** (`RWSEM_READER_BIAS` moderno), nunca liberado (`up_read`) nem incrementado por um
+///    segundo leitor, pelo tempo inteiro observado.
+/// 3. **Refinamento de causa provável**: como o corpo do loop em si (a subrotina chamada, ainda não
+///    identificada por símbolo — `0xc02529b4`, ver sessão anterior) recebe argumentos CONSTANTES a
+///    cada chamada (mesmo `r0`/`r2` originais, mesmo endereço de falta), o bug mais provável não
+///    está DENTRO dessa subrotina (que se comporta de forma determinística e correta para os
+///    mesmos argumentos), mas sim no CHAMADOR: algo no laço externo (plausivelmente
+///    `copy_strings`/`fault_in_pages_writeable` do `execve()`, iterando página a página) deveria
+///    avançar o endereço/contador entre chamadas e não está avançando — ou nunca alcança essa
+///    atualização porque o corpo do loop de 157 instruções sempre retorna pelo mesmo caminho
+///    (`b` incondicional de volta ao início, nunca o "fall-through" que levaria ao incremento).
+/// 4. **Não investigado nesta sessão** (fora do orçamento): (a) os bits de `thread_info`
+///    (`TIF_NEED_RESCHED`/preempt-count) via o ponteiro já capturado (`lr = *(TPIDRURO+0x520)`),
+///    que poderiam explicar por que o retorno de IRQ nunca força uma reavaliação que tire o código
+///    desse caminho; (b) o mapeamento do endereço `0xc02529b4` para um símbolo real do kernel —
+///    sem `vmlinux`/`System.map` desta build específica, só desmontagem crua está disponível, e
+///    cross-referenciar contra o fonte público do kernel 6.18.33 não foi feito nesta sessão.
+///    **Próximo passo recomendado, concreto**: (a) ler `thread_info->flags`/`preempt_count` no
+///    mesmo ponto do loop (offset a determinar na struct real do kernel 6.18) a cada período, para
+///    ver se `TIF_NEED_RESCHED` está setado e nunca é atendido; (b) alternativamente, tracear o
+///    PRIMEIRO período em que o loop começa (não os últimos, como fez esta sessão) para capturar o
+///    valor que o "laço externo" tinha ANTES de entrar neste padrão — pode revelar se ele já nasceu
+///    com um valor que nunca poderia progredir (ex.: um tamanho/contagem zerado por engano) em vez
+///    de progredir e travar depois. `mvn -o test` verde no `virtual-arm-box`; harness temporário
+///    desta sessão (`Trace.java`, fora do repositório, no diretório de scratch) não commitado, mesmo
+///    precedente de sessões anteriores. Nenhum arquivo do `arm-jitter` tocado. M3 continua
+///    `@Disabled`. M1/M2 continuam fechados.
+///
+/// ---
+///
+/// **ESTADO ANTERIOR (sessão de trace instrução-a-instrução do loop, 2026-08-18 (2))**
 ///
 /// Seguindo o próximo passo recomendado pela sessão anterior (trace instrução-a-instrução focado
 /// em `0xc05b1750`-`0xc05b1980`, registrando registradores a cada iteração), um harness temporário
