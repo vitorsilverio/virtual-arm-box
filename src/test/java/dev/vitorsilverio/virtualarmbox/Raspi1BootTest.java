@@ -16,8 +16,102 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// Aceite da task F3 (`--machine=raspi1`) — ver `tasks/trilha-f-infra/f3-raspi1-machine.md`.
 ///
-/// **ESTADO ATUAL (sessão de inspeção de memória do loop, 2026-08-18 (3)) — leia isto primeiro,
-/// o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+/// **ESTADO ATUAL (sessão de identificação da rotina + instrumentação de abort, 2026-08-18 (4)) —
+/// leia isto primeiro, o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+///
+/// Duas descobertas concretas nesta sessão, a primeira estática (desmontagem cruzada contra o
+/// fonte real do kernel) e a segunda dinâmica (instrumentação de aborts de memória), que juntas
+/// isolam o problema a uma pergunta muito mais estreita do que qualquer sessão anterior alcançou:
+///
+/// 1. **A rotina foi identificada com certeza, por correspondência byte-a-byte contra o fonte real
+///    do kernel** (`arch/arm/lib/uaccess_with_memcpy.c`, baixado via `curl` do
+///    `raw.githubusercontent.com/torvalds/linux/v6.18/...` — o `elixir.bootlin.com` não serve
+///    fonte cru por `WebFetch`, só a árvore de navegação). O loop de 157 passos JÁ CONHECIDO
+///    (`0xc05b1750`-`0xc05b18c4`, ver sessões anteriores) é `__copy_to_user_memcpy()` chamada por
+///    `arm_copy_to_user()` (`execve("/init")` copiando `argv`/`envp` para a nova pilha, confirma a
+///    hipótese "cópia de execve" já levantada antes). A desmontagem real (`arm-none-eabi-objdump`
+///    sobre o `kernel.img` descomprimido no host, `--adjust-vma=0xc0008000`) bate instrução por
+///    instrução com o C:
+///    ```c
+///    while (!pin_page_for_write(to, &pte, &ptl)) {          // 0xc05b1868: bl pin_page_for_write
+///        if (!atomic) mmap_read_unlock(current->mm);         // 0xc05b18fc..: (só no caminho de falha)
+///        if (__put_user(0, (char __user *)to))                // 0xc05b189c: strb r4,[r6],#0 (r4=0)
+///            goto out;
+///        if (!atomic) mmap_read_lock(current->mm);
+///    }
+///    ```
+///    `pin_page_for_write()` retorna sucesso (`1`) só quando
+///    `pte_present() && pte_young() && pte_write() && pte_dirty()` — bate com a máscara
+///    `and r2,r2,#0xC3; cmp r2,#0x43` vista na desmontagem em `0xc05b17b8`/`0xc05b17bc`. O `r6`
+///    nunca avança porque, na leitura CORRETA do C, ele só avança DEPOIS que o `while` acima
+///    termina (`to += tocopy`) — o `r6` congelado observado pelas sessões anteriores é o
+///    COMPORTAMENTO ESPERADO de estar preso dentro do `while`, não um bug de "registrador que
+///    deveria incrementar e não incrementa" como as hipóteses anteriores supunham.
+/// 2. **Instrumentação dinâmica decisiva**: um harness temporário (`Raspi1DiagTempTest`, removido
+///    antes do commit, mesmo precedente de sessões anteriores) registrou
+///    {@link dev.vitorsilverio.armjitter.core.ArmTraceListener#onMemoryAbort} durante um
+///    fast-forward de ~5,1 milhões de fatias em JIT (a mesma técnica de detecção de estagnação do
+///    console das sessões anteriores) contando TODOS os aborts de memória do boot inteiro, não só
+///    os do loop. Resultado: **exatamente 1 (UM) abort em todo o período, e é justamente o `strb`
+///    de `0xc05b189c`** (`instructionAddress==0xc05b189c`), com `fault.virtualAddress()=0x0014622d`
+///    — bate em cheio com o endereço-alvo do "byte de prova" já identificado pelas sessões
+///    anteriores (`[0x0014622d]`, a mesma palavra vigiada na sessão de inspeção de memória). Ou
+///    seja: **o mecanismo de permissão (`AP`/DACR) do `arm-jitter` funciona corretamente aqui** —
+///    a PRIMEIRA tentativa de `__put_user(0,to)` falta (como o Linux espera, página nova/anônima
+///    ainda sem `young`/`dirty`/`write` marcados), a falta é entregue, o handler do kernel
+///    corrige a permissão (comprovado porque NENHUM abort seguinte acontece nas ~5 milhões de
+///    fatias restantes — a escrita física passa a suceder sempre) — **mas mesmo assim
+///    `pin_page_for_write()` continua retornando falha para sempre**, porque senão o `while`
+///    teria saído e o padrão de 157 passos idêntico a cada período (já confirmado por sessões
+///    anteriores) teria mudado.
+/// 3. **A pergunta ficou MUITO mais estreita**: como o bit de permissão de hardware (`AP`) claramente
+///    foi corrigido pelo handler de falta do kernel (a escrita física para de faltar), mas os bits
+///    de contabilidade SOFTWARE que `pin_page_for_write()` relê da PTE (`pte_young`/`pte_dirty`/
+///    `pte_write`, campos do formato Linux de 2 níveis do ARM, empacotados na MESMA palavra de 32
+///    bits que o `AP` de hardware, mas em posições de bit DIFERENTES — ver
+///    `arch/arm/include/asm/pgtable-2level.h`) nunca refletem o conserto, a pergunta deixou de ser
+///    "existe um bug genérico de permissão/DACR/LDREX" (já descartado por 3 sessões) e virou: **o
+///    `arm-jitter` decodifica o campo `AP` (bits corretos, `PAGE_AP_SHIFT=4`,
+///    `TranslatingAddressSpace`) e ISSO FUNCIONA — mas os outros bits da MESMA palavra de PTE (que
+///    `pin_page_for_write` lê diretamente da RAM do guest, sem NENHUM envolvimento do `arm-jitter`)
+///    aparentemente não estão sendo escritos pelo handler de falta do kernel do jeito que
+///    `pin_page_for_write` espera — ou porque o handler do kernel está tomando um caminho de "só
+///    corrige `young`" (fault minor, sem marcar `dirty`) diferente do caminho "página anônima nova,
+///    já marca tudo de uma vez" que o hardware/AP corrigido sugere, ou porque HÁ um bug real (nesta
+///    hipótese, do `arm-jitter`) numa parte do ciclo de falta que NÃO é a checagem de `AP` em si —
+///    candidatos concretos: (a) o valor de `FSR`/`DFSR` (tipo exato de fault status) entregue ao
+///    kernel pode estar sinalizando o TIPO errado de falta (ex.: "seção" em vez de "página", ou
+///    "permissão" em vez de "tradução"), fazendo `do_page_fault` tomar um ramo do kernel que só
+///    atualiza PARTE das flags; (b) a própria escrita da PTE pelo kernel (`set_pte_at`) pode estar
+///    indo para o endereço físico certo mas sendo mascarada por uma tradução STALE na micro-TLB do
+///    `arm-jitter` para o espaço de endereço KERNEL (não o do usuário) na hora em que
+///    `pin_page_for_write` FAZ SUA PRÓPRIA leitura da PTE (a leitura da PTE em si passa pela MMU do
+///    `arm-jitter` para o mapeamento linear do kernel, então uma micro-TLB desatualizada ali
+///    devolveria um valor ANTIGO mesmo que a RAM física já tenha o valor novo).
+/// 4. **Próximo passo recomendado, concreto e mais barato que mais trace de registrador**: dump
+///    direto de memória (não registrador) da palavra de PTE de `0x0014622d` (página `0x00146000`),
+///    ANTES e DEPOIS do único abort observado, para comparar bit a bit contra
+///    `arch/arm/include/asm/pgtable-2level.h` (`L_PTE_YOUNG`/`L_PTE_DIRTY`/`L_PTE_RDONLY`/
+///    `L_PTE_PRESENT`, baixável do mesmo jeito que esta sessão baixou `uaccess_with_memcpy.c`, via
+///    `curl raw.githubusercontent.com/torvalds/linux/v6.18/arch/arm/include/asm/pgtable-2level.h`
+///    — `WebFetch` sozinho falhou contra o Bootlin, mas `curl` direto ao GitHub funcionou bem, usar
+///    essa rota). Para achar o ENDEREÇO físico da PTE sem instrumentar C, o caminho mais barato é
+///    ler `TTBR0` via o hook `Cp15VmsaCoprocessor` (não exposto por `Bcm2835Machine` hoje — precisa
+///    de um acessor novo ou reflexão) e andar as tabelas L1/L2 manualmente (`va>>20` para o índice
+///    L1, `(va>>12)&0xFF` para o L2), mesma técnica já usada nas sessões de `CR_XP`/`SCTLR`. Só
+///    depois de isolar QUAL bit da palavra de PTE diverge do esperado é que dá para saber se o
+///    conserto é no `arm-jitter` (ex.: reportar o tipo de fault errado) ou requer entender melhor
+///    o caminho exato do `do_page_fault` do kernel 6.18.33 real para essa combinação de VMA
+///    (anônima, `VM_WRITE`, primeira falta).
+/// 5. `mvn -o test` verde no `virtual-arm-box`; harness temporário (`Raspi1DiagTempTest`) removido
+///    antes do commit, mesmo precedente de sessões anteriores. Nenhum arquivo do `arm-jitter`
+///    tocado — o mecanismo de `AP`/DACR foi CONFIRMADO correto nesta sessão (não é mais suspeito
+///    para este bloqueio específico), a causa exata ainda não isolada é do lado da PTE/kernel.
+///    M3 continua `@Disabled`. M1/M2 continuam fechados.
+///
+/// ---
+///
+/// **ESTADO ANTERIOR (sessão de inspeção de memória do loop, 2026-08-18 (3))**
 ///
 /// Seguindo o passo (b) recomendado pela sessão anterior — inspecionar CONTEÚDO DE MEMÓRIA, não só
 /// registradores, em `[r6]=[0x0014622d]` e na palavra de contagem do `rw_semaphore`
