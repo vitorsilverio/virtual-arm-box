@@ -16,8 +16,77 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// Aceite da task F3 (`--machine=raspi1`) — ver `tasks/trilha-f-infra/f3-raspi1-machine.md`.
 ///
-/// **ESTADO ATUAL (sessão de diagnóstico do TERCEIRO bloqueio de M3, 2026-08-18) — leia isto
+/// **ESTADO ATUAL (sessão de trace instrução-a-instrução do loop, 2026-08-18 (2)) — leia isto
 /// primeiro, o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+///
+/// Seguindo o próximo passo recomendado pela sessão anterior (trace instrução-a-instrução focado
+/// em `0xc05b1750`-`0xc05b1980`, registrando registradores a cada iteração), um harness temporário
+/// (dois-fases: fast-forward via `Bcm2835Machine.Backend.JIT`/`runSlice()` até perto do loop, depois
+/// `ArmCore#step()` puro para tracing — mesmo precedente das sessões de CPSR.E/tempestade de IRQ)
+/// capturou o loop real e **DESCARTOU a hipótese de bug de `LDREX`/`STREX`/DACR no `arm-jitter`**
+/// levantada pela sessão anterior, com evidência dinâmica concreta:
+///
+/// 1. **O loop persistente real é DIFERENTE do hipotetizado por disassembly estático**: não é o
+///    `sub r7,r7,r9; bne` em `0xc05b1940`/`0xc05b194c` (código nunca alcançado nesta sessão) — é um
+///    corpo menor e completamente determinístico de **157 instruções** em `0xc05b1750`-`0xc05b18c4`
+///    que chama 3 sub-rotinas (`0xc0a979fc`, um fast-path de `rw_semaphore` já suspeitado; `0xc008e510`,
+///    um padrão `LDREX`/`STREX`/`MSR CPSR_c` típico de `local_irq_save`/preempt-count; e `0xc02529b4`,
+///    ainda NÃO identificado, com um padrão de `AND`/`SUB`/`CMP` sobre uma tabela — candidato a
+///    `vprintk`/`__ratelimit`/busca de símbolo) e então salta incondicionalmente (`b`, não `bl`/retorno)
+///    de volta ao próprio início.
+/// 2. **Confirmado por registrador, não por padrão de bytes**: TODOS os registradores de propósito
+///    geral amostrados (`r0`-`r4`, `r6`, `r9`, `r13`, `r14`) voltam ao valor **bit-a-bit idêntico** no
+///    início de cada período, replicado em 20+ repetições consecutivas (período = exatamente 157
+///    passos de `step()`, sem desvio). Nenhum progresso mensurável em NENHUM registrador visível —
+///    contradiz a hipótese anterior de "contador de bytes restantes que nunca chega a zero" (não há
+///    contador algum mudando; o código que faria isso nunca é executado).
+/// 3. **A escrita de prova (`strb`) é real e foi confirmada dinamicamente pela primeira vez**:
+///    `e4c64000` em `0xc05b189c` = `strb r4,[r6],#0`, com `r4=0` (byte escrito) e `r6=0x0014622d`
+///    (endereço FIXO, nunca varia) — bate com a hipótese DACR/PAN da sessão anterior. Mas o par
+///    `MRC`/`BIC`/`ORR`/`MCR p15,0,c3,c0,0` ao redor dela **rodeia corretamente**: o valor escrito no
+///    DACR é `0x55` e a releitura seguinte no início do próximo período também é `0x55` — **round-trip
+///    perfeito, sem o bug de "bits não modelados somem" que já foi corrigido para o SCTLR** (ver
+///    histórico desta classe). Isso descarta a hipótese de bug de armazenamento do DACR.
+/// 4. **`LDREX`/`STREX` resolvem corretamente nos DOIS pontos de chamada observados**: tanto no
+///    fast-path do `rw_semaphore` (`0xc0a97a14`-`0xc0a97a24`) quanto na primitiva em `0xc008e510`
+///    (`0xc008e53c`-`0xc008e550` e `0xc008e564`-`0xc008e574`) o `STREX` sempre sucede na PRIMEIRA
+///    tentativa (o `TEQ`/`BNE` de retry nunca é tomado) — nenhuma tempestade de retry, nenhuma
+///    falha de monitor exclusivo observada em nenhuma das 20+ repetições. Isso descarta a hipótese
+///    de bug de correção do `LDREX`/`STREX` no `arm-jitter` levantada pela sessão anterior.
+/// 5. **O timer periódico AINDA entrega IRQ nesta janela específica do boot** (achado novo, checagem
+///    dirigida): 100.000 `runSlice()` (não `step()`, que não atualiza o timer/IC) a partir do loop
+///    entraram em `CpuMode.IRQ` 27 vezes — ordem de grandeza compatível com a taxa "~2 em 2000"
+///    medida pela sessão anterior sobre a corrida inteira. Isso descarta "IRQ parou de novo" como
+///    causa deste bloqueio específico: os ticks continuam chegando, mas o loop não sai mesmo assim.
+/// 6. **Achado colateral relevante via dump do console**: bem antes do ponto de travamento, o log
+///    real do kernel mostra o bug de "Division by zero in kernel" (já documentado nesta classe como
+///    "achado colateral não-bloqueante" numa sessão anterior) acontecendo DUAS vezes em
+///    `pl011_set_termios`→`uart_update_timeout`→`div64_u64`, disparado por `console_on_rootfs()`
+///    abrindo `/dev/console` — não fatal (o kernel trata `Ldiv0`/`Ldiv0_64` retornando um resultado
+///    dummy), o boot segue normalmente até `"Freeing unused kernel image (initmem) memory: 500K"` e
+///    `"Run /init as init process"`. **O console fica em SILÊNCIO TOTAL depois disso** (0 bytes novos
+///    em 100.000 fatias adicionais de checagem de IRQ) — o travamento acontece bem cedo dentro do
+///    `execve("/init")`, antes do PID 1 (busybox `/init`) produzir qualquer saída observável.
+/// 7. **Próximo passo recomendado, concreto**: como o `arm-jitter` foi efetivamente descartado como
+///    causa (DACR/`LDREX`/`STREX` comportam-se corretamente e de forma determinística), a
+///    investigação deve mudar de eixo — em vez de mais trace de registrador, (a) identificar a
+///    sub-rotina `0xc02529b4` (a única das 3 chamadas ainda não identificada) cruzando contra o
+///    `vmlinux`/mapa de símbolos do kernel 6.18.33 real, se disponível, para saber exatamente o que
+///    ela faz e por que sempre retorna o mesmo resultado; (b) inspecionar CONTEÚDO DE MEMÓRIA (não só
+///    registradores) nos endereços `[r6]=[0x0014622d]` e `[r0]=[0xc1558c2c]` (a palavra de contagem do
+///    `rw_semaphore`) antes/depois de cada período, já que a condição de saída deste loop
+///    aparentemente não depende de NENHUM registrador de propósito geral observado — só pode
+///    depender de memória, de um registrador CP15 não amostrado (ex.: `FPEXC`/VFP,
+///    `TIF_NEED_RESCHED` em `thread_info`) ou de uma condição verdadeiramente externa (scheduler/
+///    kthread que nunca roda num single-core sem os dispositivos desabilitados por esta task). `mvn
+///    -o test` verde no `virtual-arm-box`; harness temporário desta sessão removido antes do commit
+///    (mesmo precedente de sessões anteriores). Nenhum arquivo do `arm-jitter` tocado — ao contrário
+///    da hipótese da sessão anterior, esta sessão fornece evidência de que NÃO há bug de
+///    `LDREX`/`STREX`/DACR ali. M3 continua `@Disabled`. M1/M2 continuam fechados.
+///
+/// ---
+///
+/// **ESTADO ANTERIOR (sessão de diagnóstico do TERCEIRO bloqueio de M3, 2026-08-18 (1))**
 ///
 /// Seguindo o próximo passo recomendado pela sessão do `FdtPatcher`/`withNodeDisabled`
 /// (2026-08-17): amostragem direta de `ArmCore` (sem trace instrução-a-instrução completo —
@@ -811,24 +880,28 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M3: sessao de diagnostico 2026-08-18 restringiu o TERCEIRO bloqueio a um loop sem "
-            + "saida perto de 'Run /init as init process' (LDREX/STREX + DACR/PAN, provavel "
-            + "fault-in de pagina do execve de /init via mmap_lock/rw_semaphore) — CPU nao esta em "
-            + "WFI nem tempestade de IRQ, fica ativa mas presa num conjunto pequeno e estavel de "
-            + "PCs para sempre; causa raiz exata (kernel vs. bug do arm-jitter) ainda NAO isolada "
-            + "— ver Javadoc da classe para o achado completo e o proximo passo recomendado.")
+    @Disabled("M3: sessao de trace 2026-08-18(2) confirmou um loop de 157 instrucoes 100% "
+            + "deterministico em 0xc05b1750-0xc05b18c4 (registradores r0-r4/r6/r9/r13/r14 "
+            + "bit-a-bit identicos a cada periodo, 20+ repeticoes) — DESCARTOU o bug de "
+            + "LDREX/STREX/DACR no arm-jitter hipotetizado antes (DACR round-trip correto, "
+            + "STREX sempre sucede de primeira em 2 call-sites distintos); timer AINDA entrega "
+            + "IRQ nesta janela (27 em 100k runSlice). Causa raiz exata (memoria nao amostrada, "
+            + "CP15 nao amostrado, ou scheduler/kthread que nunca roda) ainda NAO isolada — ver "
+            + "Javadoc da classe para o achado completo e o proximo passo recomendado.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void bootsToInteractiveBusyboxShellAcceiteM3Interpreted() throws Exception {
         assertReachesInteractiveShell(Bcm2835Machine.Backend.INTERPRETED);
     }
 
-    @Disabled("M3: sessao de diagnostico 2026-08-18 restringiu o TERCEIRO bloqueio a um loop sem "
-            + "saida perto de 'Run /init as init process' (LDREX/STREX + DACR/PAN, provavel "
-            + "fault-in de pagina do execve de /init via mmap_lock/rw_semaphore) — CPU nao esta em "
-            + "WFI nem tempestade de IRQ, fica ativa mas presa num conjunto pequeno e estavel de "
-            + "PCs para sempre; causa raiz exata (kernel vs. bug do arm-jitter) ainda NAO isolada "
-            + "— ver Javadoc da classe para o achado completo e o proximo passo recomendado.")
+    @Disabled("M3: sessao de trace 2026-08-18(2) confirmou um loop de 157 instrucoes 100% "
+            + "deterministico em 0xc05b1750-0xc05b18c4 (registradores r0-r4/r6/r9/r13/r14 "
+            + "bit-a-bit identicos a cada periodo, 20+ repeticoes) — DESCARTOU o bug de "
+            + "LDREX/STREX/DACR no arm-jitter hipotetizado antes (DACR round-trip correto, "
+            + "STREX sempre sucede de primeira em 2 call-sites distintos); timer AINDA entrega "
+            + "IRQ nesta janela (27 em 100k runSlice). Causa raiz exata (memoria nao amostrada, "
+            + "CP15 nao amostrado, ou scheduler/kthread que nunca roda) ainda NAO isolada — ver "
+            + "Javadoc da classe para o achado completo e o proximo passo recomendado.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void bootsToInteractiveBusyboxShellAcceiteM3Jit() throws Exception {
