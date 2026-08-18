@@ -147,6 +147,121 @@ public final class FdtPatcher {
         }
     }
 
+    /// Devolve uma cópia de `dtb` com o nó `nodeName` (e toda sua subárvore — propriedades e
+    /// sub-nós aninhados) **removido de verdade** do bloco de estrutura — diferente de
+    /// {@link #withNodeDisabled}, que só marca `status = "disabled"` deixando o nó (e o hardware
+    /// que ele descreve, do ponto de vista do parser) presente no FDT. Achado real da task F11
+    /// (`cpu@1`/`cpu@2`/`cpu@3` do Raspberry Pi 3 quad-core, para rodar só o núcleo 0 sem SMP):
+    /// um kernel real espera um nó `cpu@N` por núcleo físico presente no Device Tree para decidir
+    /// quantos núcleos tentar trazer online (`arch/arm64/kernel/smp.c: of_get_cpu_node`/
+    /// `smp_init_cpus`) — desabilitar via `status` não é suficiente aqui (o binding de CPU do
+    /// Linux trata um nó `cpu` com `status="disabled"` como "núcleo existe fisicamente mas está
+    /// offline no boot", ainda contabilizado por `nr_cpu_ids`/topologia; a spec F11 quer que o
+    /// núcleo simplesmente NÃO EXISTA do ponto de vista do kernel, evitando qualquer SMP bring-up).
+    ///
+    /// Diferente de {@link #withProperty} (que só sobrescreve o VALOR de uma propriedade,
+    /// preservando a topologia da árvore), remover um nó do MEIO da árvore muda o número de
+    /// tokens `FDT_BEGIN_NODE`/`FDT_PROP`/`FDT_END_NODE` do bloco de estrutura — todo o restante
+    /// do arquivo (resto do bloco de estrutura + bloco de strings) desliza por `removedLength`
+    /// bytes, e os três campos de cabeçalho que apontam para depois do nó removido
+    /// (`totalsize`/`size_dt_struct`/`off_dt_strings`) são corrigidos. O bloco de strings em si
+    /// NÃO é compactado (nomes de propriedade do nó removido podem ficar sem nenhum uso — um FDT
+    /// real tolera strings "órfãs" no bloco de strings, `dtc`/`libfdt` nunca as removem
+    /// automaticamente também) — mesma disciplina de simplicidade de {@link #withNewProperty}
+    /// (que só ANEXA strings, nunca remove).
+    ///
+    /// @throws IllegalArgumentException se o nó não existir no FDT
+    public static byte[] withNodeRemoved(byte[] dtb, String nodeName) {
+        int magic = readWord(dtb, FIELD_MAGIC * Integer.BYTES);
+        if (magic != MAGIC) {
+            throw new IllegalArgumentException(
+                    "não é um FDT válido: magic=0x" + Integer.toHexString(magic));
+        }
+        int offDtStruct = readWord(dtb, FIELD_OFF_DT_STRUCT * Integer.BYTES);
+        int offDtStrings = readWord(dtb, FIELD_OFF_DT_STRINGS * Integer.BYTES);
+        int sizeDtStruct = readWord(dtb, FIELD_SIZE_DT_STRUCT * Integer.BYTES);
+
+        int[] span = findNodeSpan(dtb, offDtStruct, sizeDtStruct, nodeName);
+        int removeStart = span[0];
+        int removeEnd = span[1];
+        int removedLength = removeEnd - removeStart;
+
+        byte[] result = new byte[dtb.length - removedLength];
+        System.arraycopy(dtb, 0, result, 0, removeStart);
+        System.arraycopy(dtb, removeEnd, result, removeStart, dtb.length - removeEnd);
+
+        writeWord(result, FIELD_TOTALSIZE * Integer.BYTES,
+                readWord(dtb, FIELD_TOTALSIZE * Integer.BYTES) - removedLength);
+        writeWord(result, FIELD_SIZE_DT_STRUCT * Integer.BYTES, sizeDtStruct - removedLength);
+        writeWord(result, FIELD_OFF_DT_STRINGS * Integer.BYTES, offDtStrings - removedLength);
+        return result;
+    }
+
+    /// Localiza o nó `nodeName` (busca por NOME, não por caminho completo — mesma convenção de
+    /// {@link #withNodeDisabled}) em qualquer profundidade da árvore e devolve
+    /// `{deslocamento do seu FDT_BEGIN_NODE, deslocamento logo após o FDT_END_NODE correspondente}`
+    /// — o intervalo `[início, fim)` a remover inteiro (nó + toda a subárvore), pronto para
+    /// {@link #withNodeRemoved}.
+    private static int[] findNodeSpan(byte[] dtb, int offDtStruct, int sizeDtStruct, String nodeName) {
+        int cursor = offDtStruct;
+        int end = offDtStruct + sizeDtStruct;
+        while (cursor < end) {
+            int token = readWord(dtb, cursor);
+            switch (token) {
+                case FDT_BEGIN_NODE -> {
+                    int nameLength = nulTerminatedLength(dtb, cursor + Integer.BYTES);
+                    String name = readNulTerminatedString(dtb, cursor + Integer.BYTES);
+                    int bodyStart = cursor + Integer.BYTES + alignUp4(nameLength + 1);
+                    if (name.equals(nodeName)) {
+                        return new int[] {cursor, skipNodeBody(dtb, bodyStart)};
+                    }
+                    cursor = bodyStart;
+                }
+                case FDT_END_NODE -> cursor += Integer.BYTES;
+                case FDT_NOP -> cursor += Integer.BYTES;
+                case FDT_PROP -> {
+                    int len = readWord(dtb, cursor + Integer.BYTES);
+                    cursor += 3 * Integer.BYTES + alignUp4(len);
+                }
+                case FDT_END -> cursor = end;
+                default -> throw new IllegalArgumentException(
+                        "token de FDT desconhecido 0x" + Integer.toHexString(token)
+                                + " no deslocamento " + cursor);
+            }
+        }
+        throw new IllegalArgumentException("nó '" + nodeName + "' não encontrado no FDT");
+    }
+
+    /// A partir de `bodyStart` (logo após o `FDT_BEGIN_NODE`+nome de um nó já identificado), varre
+    /// suas propriedades e sub-nós — recursivamente para sub-nós aninhados, já que a subárvore
+    /// inteira faz parte do intervalo a remover — até o `FDT_END_NODE` que fecha ESTE nó.
+    ///
+    /// @return o deslocamento logo após esse `FDT_END_NODE`
+    private static int skipNodeBody(byte[] dtb, int bodyStart) {
+        int cursor = bodyStart;
+        while (true) {
+            int token = readWord(dtb, cursor);
+            switch (token) {
+                case FDT_PROP -> {
+                    int len = readWord(dtb, cursor + Integer.BYTES);
+                    cursor += 3 * Integer.BYTES + alignUp4(len);
+                }
+                case FDT_NOP -> cursor += Integer.BYTES;
+                case FDT_BEGIN_NODE -> {
+                    int nameLength = nulTerminatedLength(dtb, cursor + Integer.BYTES);
+                    int childBodyStart = cursor + Integer.BYTES + alignUp4(nameLength + 1);
+                    cursor = skipNodeBody(dtb, childBodyStart); // pula a subárvore filha inteira.
+                }
+                case FDT_END_NODE -> {
+                    return cursor + Integer.BYTES;
+                }
+                default -> throw new IllegalArgumentException(
+                        "token de FDT desconhecido 0x" + Integer.toHexString(token)
+                                + " no deslocamento " + cursor + " dentro do corpo de um nó");
+            }
+        }
+    }
+
     /// `linux,initrd-start`/`linux,initrd-end` são células únicas de 32 bits nesta árvore (mesmo
     /// `#address-cells = 1` já confirmado por `/memory@0/reg`, `MEMORY_REG_BYTES`).
     private static byte[] singleCell(long value) {
