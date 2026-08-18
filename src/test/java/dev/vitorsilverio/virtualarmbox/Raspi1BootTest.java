@@ -16,8 +16,60 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// Aceite da task F3 (`--machine=raspi1`) — ver `tasks/trilha-f-infra/f3-raspi1-machine.md`.
 ///
-/// **ESTADO ATUAL (sessão de decode MCRR/MRRC, 2026-08-17) — leia isto primeiro, o resto do
-/// Javadoc abaixo é histórico cronológico de sessões anteriores.** M1 fechado. M2: o abort storm
+/// **ESTADO ATUAL (sessão de diagnóstico do TERCEIRO bloqueio de M3, 2026-08-18) — leia isto
+/// primeiro, o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+///
+/// Seguindo o próximo passo recomendado pela sessão do `FdtPatcher`/`withNodeDisabled`
+/// (2026-08-17): amostragem direta de `ArmCore` (sem trace instrução-a-instrução completo —
+/// mais barato, mesmo precedente da sessão de reconhecimento do timer) confirmou que a CPU
+/// **NÃO** está em `WFI`/HALT (`sleepState()` fica `RUNNING` o tempo todo, `halted()`/`stopped()`
+/// nunca verdadeiros) nem presa numa tempestade de IRQ (modo fica quase sempre `SUPERVISOR`, só
+/// 2 amostras em 2000 caem em `IRQ`) — descartando as duas hipóteses mais óbvias herdadas do
+/// histórico desta task. Um histograma de PC (amostrado a cada 100 fatias, ~187 mil amostras em
+/// 8 minutos reais) mostrou **exatamente onde**: o console para de crescer definitivamente na
+/// amostra 6964/187633 (isto é, nos primeiros ~3,7% da corrida) e, dali em diante, a CPU
+/// continua executando ativamente (nunca para), mas concentrada num conjunto pequeno e ESTÁVEL
+/// de ~20 endereços "quentes" (cada um com contagem quase idêntica, ~2500, muito acima da média
+/// de ~150 dos ~1257 endereços únicos vistos no total) — a assinatura clássica de um LOOP sem
+/// saída, não de trabalho legítimo diverso (que continuaria descobrindo endereços novos pelo
+/// resto da corrida).
+///
+/// Desmontando essa região quente (`arm-none-eabi-objdump -D -b binary -m arm
+/// --adjust-vma=0xc0008000` no `kernel.img` descomprimido pelo host, sem símbolos — kernel
+/// virtual base `0xc0008000` = {@link dev.vitorsilverio.virtualarmbox.boot.ZImageDecompressor#TEXT_OFFSET}
+/// somado a `PAGE_OFFSET`) revela um padrão reconhecível: um loop em `0xc05b185c` que (a) chama
+/// uma rotina em `0xc0a979fc` que faz `LDREX`/`STREX` para incrementar um contador de 32 bits em
+/// passos de `0x100` e testa os bits `0x80000007` do resultado — a forma clássica do fast-path de
+/// um **`rw_semaphore`** (`down_read`, provavelmente `mmap_lock`, dado o contexto de
+/// `execve()`/fault-in de página) — e (b) executa uma escrita de PROVA de 1 byte
+/// (`strb r4,[r6],#0`) cercada por `MRC`/`MCR p15,0,c3,c0,0` (leitura/escrita do **DACR**) — a
+/// implementação clássica de `CONFIG_CPU_SW_DOMAIN_PAN` (PAN emulado via troca do domínio de
+/// acesso do usuário), o mesmo mecanismo de `v6_clear_user_highpage_aliasing` cujo `MCRR`/`MRRC`
+/// já tinha sido corrigido numa sessão anterior desta task — mas aqui é outra rotina irmã,
+/// plausivelmente `fault_in_pages_writeable`/`copy_strings`/`setup_arg_pages` (o `execve()` de
+/// `/init` copiando `argv`/`envp` para a nova pilha, forçando o fault-in página a página antes da
+/// cópia em massa). O acquire do rwsem parece ter sucesso no fast-path a cada chamada (o slow-path
+/// em `0xc0a97490`, que desabilita IRQ e manipula uma wait-list — `rwsem_down_read_slowpath` — quase
+/// não aparece no histograma), mas o loop externo em `0xc05b1940`/`0xc05b194c`
+/// (`sub r7,r7,r9; cmp r7,#0; bne 0xc05b185c`) nunca reduz `r7` a zero — ou seja, a CONTABILIDADE
+/// de "bytes restantes" nunca avança, apesar de cada iteração aparentar sucesso individualmente.
+/// **Hipótese concreta, NÃO confirmada**: um bug de correção em `LDREX`/`STREX`/DACR do
+/// `arm-jitter` sob esta combinação específica (nunca exercitada antes desta task: monitor
+/// exclusivo real + `CONFIG_CPU_SW_DOMAIN_PAN` + fault-in de página do usuário juntos) faz o
+/// "byte copiado com sucesso" nunca ser refletido no contador que o loop externo usa para decidir
+/// quando parar — mesma categoria dos bugs reais já encontrados nesta task (SCTLR, CPACR, unaligned
+/// access, CPSR.E-on-exception-entry), mas desta vez não isolado ao nível de opcode exato.
+/// **Próximo passo recomendado, concreto**: (a) cross-referenciar os endereços
+/// `0xc05b174c`/`0xc05b185c`/`0xc008e510`/`0xc0240060`/`0xc0240110`/`0xc02400bc` contra o fonte
+/// real do kernel 6.18.33 (`arch/arm/lib/`, `mm/gup.c`/`fs/exec.c` — `fault_in_pages_writeable`/
+/// `copy_strings`) para confirmar a hipótese sem adivinhar semântica pelo padrão de bytes; (b) um
+/// trace instrução-a-instrução (`ArmCore#step()`, técnica já usada nas sessões de CPSR.E/tempestade
+/// de IRQ) focado SÓ nesse loop pequeno (endereços `0xc05b1750`-`0xc05b1980`), registrando o valor
+/// de `r7`/`r9`/o resultado do `strb` de prova a cada iteração, para confirmar exatamente qual
+/// registrador para de avançar e por quê. `mvn -o test` verde no `virtual-arm-box`; harness
+/// temporário desta sessão removido antes do commit (mesmo precedente de sessões anteriores).
+/// Nenhum arquivo do `arm-jitter` tocado — a hipótese de bug real ali não foi confirmada, só
+/// levantada. M3 continua `@Disabled`. M1 fechado. M2: o abort storm
 /// de `CPSR.E` (sessão anterior) e o panic de VFS (`FdtPatcher`, sessão anterior) estão
 /// resolvidos; o bloqueio mais recente conhecido era `Oops - undefined instruction` em
 /// `v6_clear_user_highpage_aliasing` por falta de decode de `MCRR`/`MRRC` — CORRIGIDO nesta
@@ -759,24 +811,24 @@ class Raspi1BootTest {
         assertReachesMarker(Bcm2835Machine.Backend.JIT, FREEING_KERNEL_MEMORY);
     }
 
-    @Disabled("M3: sessao do FdtPatcher/status=disabled fechou mmc0/sdhost E usb/dwc_otg (dois "
-            + "bloqueios reais), mas revelou um TERCEIRO bloqueio logo apos 'Run /init as init "
-            + "process' — console fica com tamanho ESTAVEL por dezenas de milhoes de fatias sem "
-            + "nenhuma linha nova (nem o echo do proprio /init, que nao depende de hardware "
-            + "nenhum) — ver Javadoc de Bcm2835Machine para o achado completo e o proximo passo "
-            + "recomendado.")
+    @Disabled("M3: sessao de diagnostico 2026-08-18 restringiu o TERCEIRO bloqueio a um loop sem "
+            + "saida perto de 'Run /init as init process' (LDREX/STREX + DACR/PAN, provavel "
+            + "fault-in de pagina do execve de /init via mmap_lock/rw_semaphore) — CPU nao esta em "
+            + "WFI nem tempestade de IRQ, fica ativa mas presa num conjunto pequeno e estavel de "
+            + "PCs para sempre; causa raiz exata (kernel vs. bug do arm-jitter) ainda NAO isolada "
+            + "— ver Javadoc da classe para o achado completo e o proximo passo recomendado.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void bootsToInteractiveBusyboxShellAcceiteM3Interpreted() throws Exception {
         assertReachesInteractiveShell(Bcm2835Machine.Backend.INTERPRETED);
     }
 
-    @Disabled("M3: sessao do FdtPatcher/status=disabled fechou mmc0/sdhost E usb/dwc_otg (dois "
-            + "bloqueios reais), mas revelou um TERCEIRO bloqueio logo apos 'Run /init as init "
-            + "process' — console fica com tamanho ESTAVEL por dezenas de milhoes de fatias sem "
-            + "nenhuma linha nova (nem o echo do proprio /init, que nao depende de hardware "
-            + "nenhum) — ver Javadoc de Bcm2835Machine para o achado completo e o proximo passo "
-            + "recomendado.")
+    @Disabled("M3: sessao de diagnostico 2026-08-18 restringiu o TERCEIRO bloqueio a um loop sem "
+            + "saida perto de 'Run /init as init process' (LDREX/STREX + DACR/PAN, provavel "
+            + "fault-in de pagina do execve de /init via mmap_lock/rw_semaphore) — CPU nao esta em "
+            + "WFI nem tempestade de IRQ, fica ativa mas presa num conjunto pequeno e estavel de "
+            + "PCs para sempre; causa raiz exata (kernel vs. bug do arm-jitter) ainda NAO isolada "
+            + "— ver Javadoc da classe para o achado completo e o proximo passo recomendado.")
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES)
     void bootsToInteractiveBusyboxShellAcceiteM3Jit() throws Exception {
