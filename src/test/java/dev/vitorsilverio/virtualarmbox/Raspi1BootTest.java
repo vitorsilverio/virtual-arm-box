@@ -16,8 +16,70 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// Aceite da task F3 (`--machine=raspi1`) — ver `tasks/trilha-f-infra/f3-raspi1-machine.md`.
 ///
-/// **ESTADO ATUAL (sessão de identificação da rotina + instrumentação de abort, 2026-08-18 (4)) —
-/// leia isto primeiro, o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+/// **ESTADO ATUAL (sessão de dump de PTE + fix real de `DFSR.WnR`, 2026-08-18 (5)) — leia isto
+/// primeiro, o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+///
+/// Seguindo o próximo passo recomendado pela sessão anterior — dump direto da palavra de PTE real
+/// do Linux em `[0x0014622d]` (formato ARM 2-level, `arch/arm/include/asm/pgtable-2level.h`,
+/// baixado via `curl`/jsdelivr do mesmo jeito que a sessão anterior baixou
+/// `uaccess_with_memcpy.c` — `raw.githubusercontent.com` direto deu HTTP 429 desta vez, o mirror
+/// `cdn.jsdelivr.net/gh/…` funcionou) — um harness temporário (`Raspi1DiagTempTest`, removido
+/// antes do commit) leu `TTBR0` via `Cp15VmsaCoprocessor#read(15,0,2,0,0)` (acessado por reflexão
+/// através dos decoradores `Bcm2835Cp14Extras`/`Bcm2835Cp15Extras`) e andou as tabelas L1/L2 A MÃO
+/// (`TranslatingAddressSpace#setMmuEnabled(false)` + `read32` = leitura física crua, sem TLB — o
+/// mesmo objeto que o `Cp15VmsaCoprocessor` já guarda) até achar a palavra de PTE "Linux" (não a
+/// de hardware — ficam em metades diferentes da mesma página de 4KiB, ver o diagrama do header).
+///
+/// **Achado 1 — confirma e ESTREITA a hipótese da sessão anterior**: a palavra real era
+/// `PRESENT=1 YOUNG=1 DIRTY=0 RDONLY=1` — `pin_page_for_write()` checa `(pte & 0xC3) == 0x43`
+/// (`PRESENT|YOUNG|DIRTY` ligados, `RDONLY` desligado); com `DIRTY=0`/`RDONLY=1` o teste falha
+/// para sempre, batendo exatamente com o loop infinito observado.
+///
+/// **Achado 2 — causa raiz ISOLADA e CORRIGIDA (bug real do `arm-jitter`, candidato (a) da sessão
+/// anterior, confirmado)**: {@link dev.vitorsilverio.armjitter.core.ArmCore#enterMemoryAbort}
+/// nunca preenchia `DFSR[11]` (`WnR`, ARM DDI 0406C B3.13.4 — `1`=falta causada por ESCRITA,
+/// `0`=leitura), mesmo com {@code MemoryTranslationException#accessType()} já disponível ali (é
+/// literalmente usado na linha de cima para decidir `DATA_ABORT` vs. `PREFETCH_ABORT`) — só o
+/// `FS[3:0]` de 4 bits chegava ao `DFSR`. O Linux real (`do_page_fault`/`__do_page_fault`) lê esse
+/// bit para decidir `FAULT_FLAG_WRITE`; sem ele, TODA falta (leitura ou escrita) parecia uma
+/// leitura para o kernel — o `strb` que causou o único abort do boot (achado da sessão anterior)
+/// era postado como falta de LEITURA, então o handler de falta corrigia o `AP` de hardware
+/// (permitindo a escrita física seguinte, por isso nenhum abort repetia) mas nunca marcava a PTE
+/// como `dirty`/gravável (que só acontece no caminho de falta de ESCRITA). **Corrigido**:
+/// `ArmCore.enterMemoryAbort` agora liga `DFSR_WNR_BIT` (`1&lt;&lt;11`) quando
+/// `fault.accessType()==DATA_WRITE`, só no caminho `onDataAbort` (`IFSR`/`onPrefetchAbort` não têm
+/// esse conceito). Aditivo/G3 (nenhuma assinatura pública muda). 2 testes de regressão novos em
+/// `ArmCoreMemoryAbortTest` (`dataAbortOnStoreSetsWnrBitInDfsr`/`dataAbortOnLoadLeavesWnrBitClearInDfsr`)
+/// + o teste pré-existente de falta de LEITURA continua batendo o `DFSR` exato (prova que o fix não
+/// muda o caminho de leitura). `mvn -o test` verde no `arm-jitter` (1369 core+truffle) + `mvn -o
+/// install`; G5 revalidado (gbaemu verde, ndsemu verde, armbox 40/41 — a 1 falha é a MESMA
+/// pré-existente de `Armv7TortureTest`/`VfpRegisters`, não relacionada a este fix).
+///
+/// **Efeito real, medido com o mesmo harness após o fix**: a MESMA palavra de PTE relida agora é
+/// `PRESENT=1 YOUNG=1 DIRTY=1 RDONLY=1` — o fix funcionou exatamente como esperado (`DIRTY` virou
+/// `1`), mas **M3 ainda NÃO fecha**: `RDONLY` continua `1`, então `(pte & 0xC3)=0xC3 != 0x43` e
+/// `pin_page_for_write()` continua falhando (por um motivo DIFERENTE e mais estreito agora).
+/// Arquiteturalmente, um Linux real nunca marca uma PTE `DIRTY=1` E `RDONLY=1` ao mesmo tempo pelo
+/// caminho de falta de escrita normal (`maybe_mkwrite(pte_mkdirty(entry), vma)` sempre limpa
+/// `RDONLY` junto com marcar `DIRTY`, a menos que `maybe_mkwrite` decida que a VMA em si não é
+/// `VM_WRITE` e deixe a página propositalmente somente-leitura) — ou seja, isso pode ainda ser
+/// **outro bug real** (do `arm-jitter` ou do `virtual-arm-box`) em uma parte diferente do ciclo de
+/// falta, ou pode ser o kernel corretamente recusando escrita numa VMA que ele não considera
+/// gravável (nesse caso o bug estaria alhures — no setup da VMA de pilha do `execve()`, fora do
+/// escopo de `arm-jitter`). **Não investigado nesta sessão** (orçamento). **Próximo passo
+/// recomendado, concreto**: (a) reler o mesmo dump de PTE, mas agora também dump da entrada de VMA
+/// correspondente (`current->mm->mmap`/`find_vma`) para confirmar se `VM_WRITE` está de fato ligado
+/// para este endereço — se não estiver, o bug é no setup de `argv`/`envp`/pilha do `execve()`, não
+/// no `arm-jitter`; (b) se `VM_WRITE` estiver ligado, tracear `do_wp_page`/`wp_page_copy` (ou o
+/// caminho equivalente de `handle_pte_fault` para uma PTE ausente+gravável — pode ser
+/// `do_anonymous_page`, não COW, já que esta pode ser a PRIMEIRA falta) para ver exatamente qual
+/// decisão deixa `RDONLY` ligado apesar de `DIRTY` ligado. `mvn -o test` verde no `virtual-arm-box`
+/// (via a suíte normal, sem o harness temporário). M3 continua `@Disabled`. M1/M2 continuam
+/// fechados.
+///
+/// ---
+///
+/// **ESTADO ANTERIOR (sessão de identificação da rotina + instrumentação de abort, 2026-08-18 (4))**
 ///
 /// Duas descobertas concretas nesta sessão, a primeira estática (desmontagem cruzada contra o
 /// fonte real do kernel) e a segunda dinâmica (instrumentação de aborts de memória), que juntas
