@@ -23,6 +23,7 @@ public final class Main {
     /// Nomes de máquina disponíveis — ver {@link #createMachine}.
     private static final String MACHINE_VERSATILEPB = "versatilepb";
     private static final String MACHINE_RASPI1 = "raspi1";
+    private static final String MACHINE_RASPI3_64 = "raspi3-64";
 
     private enum Backend {
         JIT, INTERPRETED, CHECK
@@ -59,7 +60,7 @@ public final class Main {
             return;
         }
 
-        Machine machine;
+        RunnableMachine machine;
         try {
             machine = createMachine(machineName, args, index, backend);
         } catch (IllegalArgumentException e) {
@@ -75,7 +76,7 @@ public final class Main {
         }
     }
 
-    private static Machine createMachine(String machineName, String[] args, int index, Backend backend)
+    private static RunnableMachine createMachine(String machineName, String[] args, int index, Backend backend)
             throws IOException {
         byte[] kernel = Files.readAllBytes(Path.of(args[index]));
         byte[] initramfs = Files.readAllBytes(Path.of(args[index + 1]));
@@ -99,9 +100,22 @@ public final class Main {
                 yield Bcm2835Machine.create(kernel, initramfs, dtb, cmdline, System.out,
                         toBcm2835Backend(backend));
             }
+            case MACHINE_RASPI3_64 -> {
+                if (index + 2 >= args.length) {
+                    throw new IllegalArgumentException(
+                            "--machine=" + MACHINE_RASPI3_64 + " precisa de <kernel8.img> <initramfs.gz> <dtb>");
+                }
+                byte[] dtb = Files.readAllBytes(Path.of(args[index + 2]));
+                String cmdline = index + 3 < args.length
+                        ? args[index + 3]
+                        : "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
+                yield Raspi364Machine.create(kernel, initramfs, dtb, cmdline, System.out,
+                        toRaspi364Backend(backend));
+            }
             default -> throw new IllegalArgumentException(
                     "máquina desconhecida: " + machineName
-                            + " (disponíveis: " + MACHINE_VERSATILEPB + ", " + MACHINE_RASPI1 + ")");
+                            + " (disponíveis: " + MACHINE_VERSATILEPB + ", " + MACHINE_RASPI1
+                            + ", " + MACHINE_RASPI3_64 + ")");
         };
     }
 
@@ -121,13 +135,27 @@ public final class Main {
         };
     }
 
+    /// Sem backend `CHECK` para `raspi3-64` (achado real, task F11): `jit64` (B6.4) não tem um
+    /// emissor de divergência A64 equivalente a {@code DivergenceCheckingCodeEmitter} (32-bit) —
+    /// nenhum consumidor A64 anterior precisou de um. `--check` lança aqui em vez de silenciosamente
+    /// cair para outro backend.
+    private static Raspi364Machine.Backend toRaspi364Backend(Backend backend) {
+        return switch (backend) {
+            case JIT -> Raspi364Machine.Backend.JIT;
+            case INTERPRETED -> Raspi364Machine.Backend.INTERPRETED;
+            case CHECK -> throw new IllegalArgumentException(
+                    "--check não existe para --machine=" + MACHINE_RASPI3_64
+                            + " (jit64 não tem emissor de divergência A64 ainda)");
+        };
+    }
+
     /// De quantas em quantas fatias o `stdin` do host é drenado para o UART0 do guest — sondagem
     /// não bloqueante (`available()`), para o laço de emulação nunca parar esperando teclado.
     private static final int STDIN_POLL_INTERVAL_SLICES = 64;
 
     /// Entrega ao UART0 o que já estiver disponível no `stdin` do host, sem bloquear: é isto que
     /// torna o shell `busybox` do guest realmente interativo pela linha de comando.
-    private static void pumpStdin(Machine machine) throws IOException {
+    private static void pumpStdin(RunnableMachine machine) throws IOException {
         while (System.in.available() > 0) {
             int typed = System.in.read();
             if (typed < 0) {
@@ -138,8 +166,9 @@ public final class Main {
     }
 
     private static void usage() {
-        System.err.println("uso: virtual-arm-box [--machine=" + MACHINE_VERSATILEPB + "|" + MACHINE_RASPI1 + "] "
-                + "[--interp|--check] [--cycles=N] <zImage> <initramfs.gz> [<dtb>] [\"cmdline\"]");
+        System.err.println("uso: virtual-arm-box [--machine=" + MACHINE_VERSATILEPB + "|" + MACHINE_RASPI1
+                + "|" + MACHINE_RASPI3_64 + "] "
+                + "[--interp|--check] [--cycles=N] <zImage|kernel8.img> <initramfs.gz> [<dtb>] [\"cmdline\"]");
         System.exit(2);
     }
 }

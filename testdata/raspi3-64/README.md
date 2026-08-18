@@ -3,6 +3,23 @@
 Mesmo espírito de `testdata/raspi1/README.md` (F3): binários REAIS, baixados de fontes
 públicas, URL e commit exatos documentados aqui, versionados no repo para reprodutibilidade.
 
+## `initramfs.cpio.gz` — **SINTÉTICO, não baixado** (mesmo bloqueio de B6.2 aceite #2/B4.0.3
+## item 3: busybox estático `aarch64` real indisponível — `busybox.net` só publica `armv8l`,
+## que é ARM 32-bit, ISA errada; devkitA64 instalado é bare-metal, sem libc/toolchain
+## `aarch64-linux-*` para compilar um binário estático real)
+
+Arquivo `cpio` (formato `newc`) contendo só o registro `TRAILER!!!` (arquivo vazio, 124 bytes),
+comprimido com `gzip`. **Não é um initramfs funcional** — não tem `/init` nem `/bin/sh` — mas
+não precisa ser: os marcos de boot desta task (`EARLYCON_BANNER`/`FREEING_KERNEL_MEMORY`, ver
+`Raspi364BootTest`) acontecem ANTES de `populate_rootfs` tentar montar/executar o initramfs; um
+`cpio` inválido ou vazio faz o kernel real logar um aviso e seguir sem travar (só falharia mais
+tarde, em `run_init_process`/"No working init found" — depois dos marcos que este teste
+verifica). Quando um busybox estático `aarch64` real ficar disponível (mesmo ambiente que
+destrava B6.2 aceite #2), substituir este arquivo por um initramfs de verdade (mesmo padrão de
+`testdata/raspi1/initramfs.cpio.gz`) para poder perseguir M3 (shell interativo).
+
+`sha256sum`: `bf2f28f9d3f267d1f4c32e685f6646db5a60ef962136508105f69e63ba9d7061`.
+
 ## `kernel8.img`
 
 Kernel Linux **AArch64** pré-compilado oficial do Raspberry Pi Foundation (Pi 2 v1.2/3/3+),
