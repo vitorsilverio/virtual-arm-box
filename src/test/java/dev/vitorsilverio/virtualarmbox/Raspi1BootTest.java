@@ -16,8 +16,57 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /// Aceite da task F3 (`--machine=raspi1`) — ver `tasks/trilha-f-infra/f3-raspi1-machine.md`.
 ///
-/// **ESTADO ATUAL (sessão de dump de PTE + fix real de `DFSR.WnR`, 2026-08-18 (5)) — leia isto
-/// primeiro, o resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+/// **ESTADO ATUAL (sessão de tentativa de oráculo QEMU, 2026-08-18 (6)) — leia isto primeiro, o
+/// resto do Javadoc abaixo é histórico cronológico de sessões anteriores.**
+///
+/// Antes de tentar a arqueologia de `mm_struct`/maple-tree recomendada pela sessão anterior (achar
+/// `VM_WRITE` da VMA em `0x0014622d` exigiria offsets de struct do kernel 6.18 sem `vmlinux`/BTF —
+/// caro e frágil de calcular à mão), esta sessão tentou o atalho mais barato que a própria task
+/// já apontava: **usar o `qemu-system-arm -M raspi1ap` instalado como oráculo externo**, bootando
+/// exatamente os mesmos `kernel.img`/`bcm2708-rpi-b.dtb`/`initramfs.cpio.gz` desta task fora do
+/// `virtual-arm-box`, para ver se um QEMU real chega ao shell (provaria bug nosso) ou trava no
+/// mesmo lugar (indicaria problema do lado do kernel/initramfs, não do emulador).
+///
+/// **Resultado: o oráculo NÃO é utilizável para esta pergunta.** `qemu-system-arm -M raspi1ap
+/// -kernel kernel.img -dtb bcm2708-rpi-b.dtb -initrd initramfs.cpio.gz -append "console=ttyAMA0,
+/// 115200 earlycon root=/dev/ram rdinit=/init" -nographic` trava e para de imprimir por completo
+/// em tempo de kernel `2.495s` — MUITO antes do ponto de bloqueio desta task (`execve("/init")`,
+/// que só acontece depois de `mmc`/`usb` — o próprio QEMU nem chega a essas linhas). A causa é um
+/// `external abort on non-linefetch` real dentro do próprio QEMU: `bcm2835_power_probe` (driver de
+/// clock/power do BCM2835, chamado via `deferred_probe_work_func` logo após
+/// `bcm2835_vchiq: Could not initialize vchiq platform` falhar) acessa um registrador MMIO que o
+/// modelo `raspi1ap` do QEMU 8.0.0 não implementa — falha do PRÓPRIO QEMU nesta combinação
+/// kernel+DTB, não um travamento do Linux. Ou seja: o `qemu-system-arm` instalado nesta máquina
+/// não modela o controlador de clock/power (CPRMAN/PM) o suficiente para levar ESTE kernel
+/// (6.18.33, que passou a sondar `bcm2835-pm`/`bcm2835-power` de forma mais agressiva que builds
+/// mais antigos) além dos 2,5s iniciais — mesma classe de lacuna que motivou o
+/// `Bcm2835Cprman` mínimo que a sessão do CPRMAN (2026-08-17) já teve que escrever no
+/// `virtual-arm-box` para o MESMO driver não travar aqui. **Achado negativo registrado para
+/// poupar sessões futuras**: não vale a pena tentar de novo o oráculo QEMU para o bloqueio de M3
+/// com este `kernel.img`/DTB — ele quebra num lugar diferente e mais cedo, por lacuna própria do
+/// `raspi1ap` do QEMU (poderia valer a pena com um DTB/kernel mais antigo/mais simples, mas isso
+/// sairia do escopo "mesmos assets" que tornava a comparação válida).
+///
+/// **Próximo passo continua sendo o já recomendado pela sessão anterior** (dump de VMA via
+/// `TPIDRURO`=`current` — confirmado como o mecanismo certo por leitura do fonte real,
+/// `arch/arm/include/asm/current.h` do kernel 6.18: `get_current()` lê `c13,c0,3` quando
+/// `CONFIG_CURRENT_POINTER_IN_TPIDRURO`/`CONFIG_SMP`, o que bate com a nota da sessão (3) sobre
+/// `TPIDRURO` já apontar para dado de thread útil — `Cp15VmsaCoprocessor.read(15,0,13,0,3)` dá o
+/// ponteiro de `task_struct` direto, sem reflexão adicional além da já usada para obter o próprio
+/// `Cp15VmsaCoprocessor`). O obstáculo real é os OFFSETS de `task_struct.mm`/`mm_struct.mm_mt`
+/// (maple tree, não rbtree/lista — trocado desde o Linux 6.1) e de `vm_area_struct.vm_flags`
+/// nesta build específica, que não têm como ser calculados só lendo o `.h` (dependem de todos os
+/// campos anteriores + `CONFIG_*`). Sem `vmlinux`/`System.map`/BTF desta build, a rota mais barata
+/// provavelmente é procurar o valor de `vm_flags` (`VM_WRITE=0x2`) por PADRÃO DE BUSCA na memória
+/// próxima ao endereço já achado do `mm_struct` (heurística: valor pequeno, bits baixos plausíveis
+/// de `VM_READ|VM_WRITE|VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC` = tipicamente `0x875` para pilha), em
+/// vez de reconstruir a struct inteira campo a campo. `mvn -o test` verde no `virtual-arm-box`
+/// (harness temporário de comparação com QEMU não commitado, sem tocar código de produção; nenhum
+/// arquivo do `arm-jitter` tocado). M3 continua `@Disabled`. M1/M2 continuam fechados.
+///
+/// ---
+///
+/// **ESTADO ANTERIOR (sessão de dump de PTE + fix real de `DFSR.WnR`, 2026-08-18 (5))**
 ///
 /// Seguindo o próximo passo recomendado pela sessão anterior — dump direto da palavra de PTE real
 /// do Linux em `[0x0014622d]` (formato ARM 2-level, `arch/arm/include/asm/pgtable-2level.h`,
