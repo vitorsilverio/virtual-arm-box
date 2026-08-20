@@ -11,7 +11,6 @@ import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -63,9 +62,50 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// precise modelar de verdade — MMU/TLB do `arm-jitter` já são "sempre coerentes" por construção,
 /// então `DC`/`IC`/`TLBI` provavelmente podem virar NO-OP aceito, não uma reimplementação de
 /// cache real; CONFERIR com o usuário/task antes de presumir). **Fora do escopo desta task** (não
-/// é bug, é família de feature nova) — candidata a sub-task própria no arm-jitter (`B6.12`?),
-/// dimensionada para cobrir a família toda de uma vez (não uma instrução por sessão como as
-/// anteriores), dado o padrão já visto aqui. {@link #reachesEarlyconBannerInterpreted}/
+/// é bug, é família de feature nova) — gap fechado pela sub-task `B6.12` do arm-jitter (as 10
+/// operações reais de `IC`/`DC` viram `NOP`, confirmado contra `helper.c` do QEMU; `DC ZVA`
+/// deliberadamente excluída).
+///
+/// **Sessão 2026-08-20 (retomada após B6.12, sessão 6) — SEXTO achado real, um BUG (não gap de
+/// feature), FIXADO nesta sessão**: com `DC IVAC` virando NO-OP, o boot avança de `0x39000` até
+/// bem mais longe (1.456.350 fatias, ~157s) e então lança `ArithmeticException: integer overflow`
+/// dentro de `AddressSpace64.Wrapping.read32` (`Math.toIntExact`). Causa raiz: `Wrapping`
+/// (adapter que o `Raspi364Machine` usa para reaproveitar o barramento físico de 32 bits existente
+/// via {@code AddressSpace64.wrapping}) usava `Math.toIntExact(address)`, que rejeita qualquer
+/// `long` positivo maior que {@code Integer.MAX_VALUE} — inclusive endereços no intervalo
+/// `[0x8000_0000, 0xFFFF_FFFF]`, que CABEM nos "4 GiB baixos" que o próprio Javadoc da classe
+/// promete suportar (só interpretados como `int` NEGATIVO, não fora de faixa). Confirmado com um
+/// harness de debug isolado (`DebugTtbr1`, fora do repo, descartado) instrumentando
+/// `Wrapping`/`TranslatingAddressSpace64` temporariamente: o endereço que disparava a exceção
+/// (ex.: PC `0x13b8164`, valores de registrador como `0xc0000000000f83`) SEMPRE caía dentro de
+/// `[0x8000_0000, 0xFFFF_FFFF]`, nunca acima de `0xFFFF_FFFF` — provando que era exatamente essa
+/// lacuna do `Math.toIntExact`, não um endereço realmente fora de faixa. **Corrigido** em
+/// `AddressSpace64.java` (`arm-jitter`): `Wrapping` agora trunca com `(int)` (preserva o padrão de
+/// bits, mesma convenção "endereço = int sem sinal" do resto de `AddressSpace`) e só lança
+/// `ArithmeticException` de verdade para `< 0` ou `> 0xFFFF_FFFF`. Teste de regressão novo,
+/// `AddressSpace64WrappingTest` (arm-jitter `core`). Commit separado no `arm-jitter`, `mvn -o
+/// install` local refletido no `.m2`.
+///
+/// **Sessão 2026-08-20 (sessão 6, MESMA sessão, após o fix acima) — SÉTIMO bloqueio real, ainda
+/// NÃO isolado por completo**: com o bug do `Wrapping` corrigido, o boot avança MAIS ainda (mesma
+/// ordem de grandeza de fatias) até um `write64` (via `executeLoadStorePair`, `STP`) tentar
+/// traduzir para um endereço físico genuinamente ACIMA de 4 GiB (`0x1_0000_0882`) — desta vez uma
+/// rejeição correta de `Wrapping` (o PA está mesmo fora da faixa suportada, não é mais o bug do
+/// `toIntExact`). Este é o mapa físico de RAM desta máquina (`RAM_SIZE_BYTES` ≈ `0x3F00_0000`,
+/// bem abaixo de 4 GiB) recebendo um PA absurdo de um page-walk — **hipótese forte, NÃO
+/// confirmada com instrumentação nesta sessão** (orçamento de tool-calls da "Disciplina de custo"
+/// já consumido pela investigação do SEXTO achado): `TranslatingAddressSpace64` só implementa
+/// `TTBR0_EL1` (achado documentado desde a spec de `B6.6.3`, comentário "só TTBR0 liga de
+/// verdade" no precedente 32-bit) — Linux real usa `TTBR1_EL1` para o espaço de endereço do
+/// kernel (VA alto, bit 63 setado) e este emulador, sem TTBR1, faz o walk usando a tabela ERRADA
+/// (`ttbr0Base`) para qualquer VA de kernel, produzindo descritores de página lixo (não
+/// inicializados/de outro propósito) cujos bits de PA combinados batem acima de 4 GiB por
+/// coincidência. **Fora do escopo desta task** (feature ausente, não bug pontual) — candidata a
+/// sub-task nova no arm-jitter (`B6.13`?): suporte a `TTBR1_EL1` em `TranslatingAddressSpace64`
+/// (segunda tabela-base + lógica de seleção por VA alto/baixo, provavelmente via `TCR_EL1.T1SZ`)
+/// + na ponte de registrador de sistema (`Aarch64VmsaSystemRegisters`, `B6.6.3`). Confirmar a
+/// hipótese com instrumentação ANTES de implementar (mesma disciplina de todas as sub-tasks
+/// anteriores desta fila) — pode haver outra causa. {@link #reachesEarlyconBannerInterpreted}/
 /// {@link #reachesEarlyconBannerJit}/{@link #reachesFreeingKernelMemoryInterpreted} continuam
 /// `@Disabled` até essa nova sub-task fechar.
 class Raspi364BootTest {
@@ -73,13 +113,6 @@ class Raspi364BootTest {
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
     private static final String EARLYCON_BANNER = "Booting Linux on physical CPU";
     private static final String FREEING_KERNEL_MEMORY = "Freeing unused kernel";
-    /// Quinto bloqueio real (sessão 2026-08-20, sessão 5, após B6.11 fechar LSLV/LSRV/ASRV/RORV):
-    /// `DC IVAC, X0` é a primeira instrução da família "System instructions" (`SYS`/`SYSL`
-    /// genérico, `op0=1`) que este boot encontra — gap de FAMÍLIA nova, não de uma instrução só.
-    /// Ver Javadoc da classe.
-    private static final String SYS_INSTRUCTION_NOT_IMPLEMENTED_MESSAGE =
-            "AArch64: encoding fora da fatia B6.1 em 0x39000: 0xd5087620";
-
     private static final int MAX_SLICES = 2_000_000;
     private static final int CONSOLE_POLL_INTERVAL = 200;
 
@@ -96,27 +129,16 @@ class Raspi364BootTest {
         assertTrue(machine.core().x(0) > 0, "X0 (endereço do DTB) deve ser não-nulo");
         assertTrue(machine.core().exceptionState().inEl1(), "esta máquina simula entrega em EL1 (D2)");
 
-        // Achado desta sessão (2026-08-20, sessão 5, ver Javadoc da classe): B6.11 (LSLV/LSRV/
-        // ASRV/RORV) desbloqueou o QUARTO gap, o boot avança mais longe e bate agora em
-        // `DC IVAC, X0`, um QUINTO gap real — mas desta vez uma FAMÍLIA inteira nova ("System
-        // instructions", SYS/SYSL genérico), não uma instrução isolada. PINADO aqui como
-        // regressão: se uma sub-task futura estender o decoder para cobrir SYS/DC (candidata a
-        // B6.12), este teste PRECISA ser atualizado (não é mais "não implementado"), sinal
-        // correto de que o bloqueio abriu — e é provável que revele mais variantes da mesma
-        // família mais à frente (DC CVAC/CIVAC/ZVA, IC IVAU/IALLU, eventualmente TLBI).
-        UnsupportedOperationException thrown = assertThrows(UnsupportedOperationException.class,
-                machine::runSlice, "esperava o gap de decode conhecido (DC IVAC) "
-                        + "— se isto não lançar mais, o bloqueio da task F11 abriu, atualizar este teste");
-        assertEquals(SYS_INSTRUCTION_NOT_IMPLEMENTED_MESSAGE, thrown.getMessage());
+        // Sessão 2026-08-20 (sessão 6, após B6.12 fechar DC/IC como NOP): o gap `DC IVAC` não
+        // lança mais — B6.12 tratou as 10 operações reais de manutenção de cache como NOP
+        // (confirmado contra `helper.c` do QEMU). `runSlice()` agora avança sem lançar.
+        machine.runSlice();
     }
 
-    @Disabled("F11 (2026-08-20, sessão 5): B6.11 (LSLV/LSRV/ASRV/RORV) fechou o QUARTO "
-            + "bloqueio, mas o boot agora bate numa FAMÍLIA inteira nova de decode: 'DC IVAC, X0' "
-            + "(System instructions, SYS/SYSL genérico op0=1), fora do subconjunto de "
-            + "registradores de sistema nomeado resolvido por Aarch64Decoder#decodeSystemRegisterId. "
-            + "Ver Javadoc da classe para o achado completo. Fora do escopo desta task (não é bug, é "
-            + "família de feature ausente) — precisa de sub-task própria no arm-jitter (candidata a "
-            + "B6.12), dimensionada para a família toda (DC/IC/AT/TLBI), não uma instrução por vez.")
+    @Disabled("F11 (2026-08-20, sessão 6): SÉTIMO bloqueio real, ainda NÃO fechado — PA "
+            + "traduzido além dos 4 GiB (0x100000882) num write64 dentro de load-store-pair, com "
+            + "TTBR1_EL1 nunca modelado (só TTBR0 liga de verdade, achado real desde B6.6.3). "
+            + "Ver Javadoc da classe.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerInterpreted() throws Exception {
