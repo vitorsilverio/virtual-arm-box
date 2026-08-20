@@ -26,38 +26,46 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// gap de feature (não bug) e devolvido ao usuário; fechado por uma sub-task separada no
 /// `arm-jitter` (`B6.8`, 2026-08-20, `CCMP`/`CCMN` decodificados e executados no interpretador).
 ///
-/// **Sessão 2026-08-20 (retomada após B6.8) — SEGUNDO bloqueio real, ainda NÃO fechado**: com
-/// `CCMP`/`CCMN` disponíveis, o boot avança de fato (a primeira instrução já não lança) até o
-/// endereço `0x13ba9e8`, onde encontra `0xaa0003f5` — `ORR X21, XZR, X0` (`LSL #0`), ou seja, o
-/// alias `MOV X21, X0` da classe **"Logical (shifted register)"**. Essa classe (que cobre
-/// `AND`/`ORR`/`EOR`/`ANDS`/`BIC`/`ORN`/`EON`/`BICS` com operando registrador — INCLUINDO o alias
-/// `MOV` de registrador, uma das instruções A64 mais comuns que existem) está, segundo o
-/// comentário explícito em `Aarch64Decoder#decodeDataProcessingRegister`
-/// (`arm-jitter/core/.../decoder64/Aarch64Decoder.java`, linha ~942): "`Logical (shifted
-/// register)`: fora do escopo fechado do épico (ver a task B6.3.1)" — ou seja, um gap de feature
-/// CONHECIDO e documentado desde B6.3.1, nunca coberto por nenhuma sub-task de B6 até agora
-/// (B6.3.1-B6.3.4 cobriram ALU shifted/extended register, `CSEL`/aliases, bitfield, mul/div,
-/// exclusive access; B6.8 cobriu só `CCMP`/`CCMN`). **Decisão desta sessão**: mesma categoria da
-/// sessão anterior — não é um bug (a lib nunca prometeu essa classe), é uma lacuna de feature
-/// fora do "Inclui"/"Não inclui" desta task ("Sem mudança no `arm-jitter`. Exceção: bug real da
-/// lib") — precisa de uma sub-task própria no `arm-jitter` (mesmo rigor de corpus real do resto
-/// do épico B6.3/B6.8), decisão para o usuário priorizar. Dado que `MOV` de registrador é
-/// onipresente em qualquer prólogo/epílogo de função A64 real, é provável que este seja o
-/// PRÓXIMO obstáculo dominante para qualquer kernel real (não uma curiosidade isolada como
-/// `CCMP` no polyglot EFI). {@link #reachesEarlyconBannerInterpreted}/
-/// {@link #reachesEarlyconBannerJit}/{@link #reachesFreeingKernelMemoryInterpreted} continuam
-/// `@Disabled` até essa nova sub-task fechar.
+/// **Sessão 2026-08-20 (retomada após B6.8) — segundo bloqueio real, FECHADO por B6.9**: com
+/// `CCMP`/`CCMN` disponíveis, o boot avançou até `0x13ba9e8` (`0xaa0003f5`, `ORR X21, XZR, X0` —
+/// alias `MOV` da classe "Logical (shifted register)"), gap fechado pela sub-task `B6.9` do
+/// arm-jitter (`AND`/`ORR`/`EOR`/`ANDS`/`BIC`/`ORN`/`EON`/`BICS` + aliases `MOV`/`MVN`).
+///
+/// **Sessão 2026-08-20 (retomada após B6.9, sessão 4) — TERCEIRO bloqueio real, ainda NÃO
+/// fechado**: com "Logical (shifted register)" disponível, o boot avança bem mais longe (de
+/// `0x13ba9e8` para `0x38fc4` — dezenas de milhares de instruções a mais) até encontrar
+/// `0xd53b0023` em `0x38fc4`. Decodificado manualmente campo a campo (`Rt=X3` bits[4:0]=`00011`,
+/// `op2=1` bits[7:5], `CRm=0` bits[11:8], `CRn=0` bits[15:12], `op1=3` bits[18:16], `o0=1`
+/// bit[19] → `op0=3`, `L=1` → leitura): é `MRS X3, CTR_EL0` (Cache Type Register, EL0-acessível),
+/// uma leitura ONIPRESENTE em qualquer boot A64 real (`dcache_line_size`/`icache_line_size` em
+/// `arch/arm64/kernel/head.S`/`cache.S`). Confirmado no código real do arm-jitter, não só por
+/// inspeção de bits: `Aarch64Decoder#decodeSystemRegisterId`
+/// (`arm-jitter/core/.../decoder64/Aarch64Decoder.java`, linha ~1476) só resolve `op0=3` com
+/// `op1=SYSREG_OP1_EL1`(registradores EL1 "gerais") OU `op1=SYSREG_OP1_EL0_TIMER`(=3) restrito a
+/// `CRn=14` (timer genérico, B6.6.7) — `CTR_EL0` tem `op1=3` mas `CRn=0`
+/// (`decodeGenericTimerRegisterId` devolve `null` porque `crn != SYSREG_CRN_TIMER`), então cai no
+/// `unsupported()` genérico. **Decisão desta sessão**: mesma categoria das duas sessões
+/// anteriores — não é bug (a lib nunca prometeu esse registrador), é lacuna de feature fora do
+/// escopo desta task ("Sem mudança no `arm-jitter`. Exceção: bug real da lib") — precisa de nova
+/// sub-task no arm-jitter (candidata a `B6.10`, mesmo rigor de corpus real de B6.8/B6.9) para
+/// estender `decodeSystemRegisterId`/`Aarch64SystemRegisterId` com o grupo "AArch64 Identification
+/// registers, EL0-acessível" (`op0=3,op1=3,CRn=0`) — `CTR_EL0` no mínimo, possivelmente
+/// `DCZID_EL0` (`CRm=0,op2=7`, também comum em `head.S` para `ZVA`) já que é a mesma família de
+/// registrador. {@link #reachesEarlyconBannerInterpreted}/{@link #reachesEarlyconBannerJit}/
+/// {@link #reachesFreeingKernelMemoryInterpreted} continuam `@Disabled` até essa nova sub-task
+/// fechar.
 class Raspi364BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi3-64");
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
     private static final String EARLYCON_BANNER = "Booting Linux on physical CPU";
     private static final String FREEING_KERNEL_MEMORY = "Freeing unused kernel";
-    /// Segundo bloqueio real (sessão 2026-08-20, após `CCMP`/`CCMN` fecharem em B6.8): "Logical
-    /// (shifted register)" (`AND`/`ORR`/`EOR`/... com operando registrador, incl. o alias `MOV`
-    /// de registrador) é gap de feature documentado desde B6.3.1, nunca implementado. Ver
-    /// Javadoc da classe.
-    private static final String LOGICAL_SHIFTED_REGISTER_NOT_IMPLEMENTED_MESSAGE =
-            "AArch64: encoding fora da fatia B6.1 em 0x13ba9e8: 0xaa0003f5";
+    /// Terceiro bloqueio real (sessão 2026-08-20, sessão 4, após "Logical shifted register"
+    /// fechar em B6.9): `MRS X3, CTR_EL0` (Cache Type Register) é gap de feature real — o
+    /// decoder só resolve `op0=3,op1=3` para o subconjunto do timer genérico (`CRn=14`, B6.6.7),
+    /// não para o grupo de identificação EL0 (`CRn=0`) ao qual `CTR_EL0` pertence. Ver Javadoc
+    /// da classe.
+    private static final String CTR_EL0_NOT_IMPLEMENTED_MESSAGE =
+            "AArch64: encoding fora da fatia B6.1 em 0x38fc4: 0xd53b0023";
 
     private static final int MAX_SLICES = 2_000_000;
     private static final int CONSOLE_POLL_INTERVAL = 200;
@@ -75,39 +83,41 @@ class Raspi364BootTest {
         assertTrue(machine.core().x(0) > 0, "X0 (endereço do DTB) deve ser não-nulo");
         assertTrue(machine.core().exceptionState().inEl1(), "esta máquina simula entrega em EL1 (D2)");
 
-        // Achado desta sessão (2026-08-20, ver Javadoc da classe): CCMP/CCMN (B6.8) desbloquearam
-        // a primeira instrução, mas o boot bate agora em "Logical (shifted register)"
-        // (ORR/alias MOV de registrador), um SEGUNDO gap de feature real, também fora do escopo
-        // desta task. PINADO aqui como regressão: se uma sub-task futura implementar essa classe,
-        // este teste PRECISA ser atualizado (não é mais "não implementado"), sinal correto de que
-        // o bloqueio abriu — e é provável que revele um TERCEIRO gap mais à frente.
+        // Achado desta sessão (2026-08-20, sessão 4, ver Javadoc da classe): B6.9 (Logical
+        // shifted register) desbloqueou o SEGUNDO gap, o boot avança bem mais longe e bate agora
+        // em `MRS X3, CTR_EL0`, um TERCEIRO gap de feature real, também fora do escopo desta
+        // task. PINADO aqui como regressão: se uma sub-task futura estender
+        // `Aarch64SystemRegisterId` para cobrir CTR_EL0 (candidata a B6.10), este teste PRECISA
+        // ser atualizado (não é mais "não implementado"), sinal correto de que o bloqueio abriu —
+        // e é provável que revele um QUARTO gap mais à frente.
         UnsupportedOperationException thrown = assertThrows(UnsupportedOperationException.class,
-                machine::runSlice, "esperava o gap de decode conhecido (Logical shifted register) "
+                machine::runSlice, "esperava o gap de decode conhecido (MRS CTR_EL0) "
                         + "— se isto não lançar mais, o bloqueio da task F11 abriu, atualizar este teste");
-        assertEquals(LOGICAL_SHIFTED_REGISTER_NOT_IMPLEMENTED_MESSAGE, thrown.getMessage());
+        assertEquals(CTR_EL0_NOT_IMPLEMENTED_MESSAGE, thrown.getMessage());
     }
 
-    @Disabled("F11 (2026-08-20): CCMP/CCMN (B6.8) fecharam o primeiro bloqueio, mas o boot agora "
-            + "bate num SEGUNDO gap de decode real do arm-jitter: 'Logical (shifted register)' "
-            + "(AND/ORR/EOR/... incl. o alias MOV de registrador), documentado como fora de escopo "
-            + "desde B6.3.1. Ver Javadoc da classe para o achado completo. Fora do escopo desta "
-            + "task (não é bug, é feature ausente) — precisa de sub-task própria no arm-jitter.")
+    @Disabled("F11 (2026-08-20, sessão 4): B6.9 (Logical shifted register) fechou o SEGUNDO "
+            + "bloqueio, mas o boot agora bate num TERCEIRO gap de decode real do arm-jitter: "
+            + "'MRS X3, CTR_EL0' (Cache Type Register, EL0-acessível), fora do subconjunto de "
+            + "registradores de sistema resolvido por Aarch64Decoder#decodeSystemRegisterId. Ver "
+            + "Javadoc da classe para o achado completo. Fora do escopo desta task (não é bug, é "
+            + "feature ausente) — precisa de sub-task própria no arm-jitter (candidata a B6.10).")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerInterpreted() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.INTERPRETED, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-20): mesmo bloqueio de reachesEarlyconBannerInterpreted (Logical "
-            + "shifted register, ver Javadoc da classe).")
+    @Disabled("F11 (2026-08-20, sessão 4): mesmo bloqueio de reachesEarlyconBannerInterpreted "
+            + "(MRS CTR_EL0, ver Javadoc da classe).")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerJit() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-20): mesmo bloqueio de reachesEarlyconBannerInterpreted (Logical "
-            + "shifted register, ver Javadoc da classe).")
+    @Disabled("F11 (2026-08-20, sessão 4): mesmo bloqueio de reachesEarlyconBannerInterpreted "
+            + "(MRS CTR_EL0, ver Javadoc da classe).")
     @Test
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryInterpreted() throws Exception {
