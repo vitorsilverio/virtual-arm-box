@@ -20,39 +20,44 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// infra de carga/handoff está correta) e `assertReachesMarker` que roda até um texto aparecer
 /// no console ou o orçamento de fatias esgotar.
 ///
-/// **Sessão 2026-08-18 (primeira tentativa de boot real) — BLOQUEIO REAL achado, NÃO fechado
-/// nesta sessão**: a infra em si (RAM/MMU/DTB/registradores/handoff) foi provada correta —
-/// {@link #smokeTestBootsWithoutException} confirma `PC=0`/`X0=`endereço do DTB/`inEl1=true`
-/// batendo com o que o próprio `kernel8.img` real espera, e a PRIMEIRA instrução do kernel8.img
-/// real (`ccmp x18, #0x0, #0xd, pl`, offset `0x0` — CONFIRMADO via
-/// `aarch64-none-elf-objdump -D -b binary -m aarch64` direto sobre o binário real, não suposição)
-/// bate byte a byte com o que `Aarch64Decoder` recebe (`0xfa405a4d` no endereço `0x0`) — ou
-/// seja, o pipeline de carga está 100% correto. **O bloqueio é um gap de decode real do
-/// `arm-jitter`**: `CCMP`/`CCMN` (Conditional Compare, imediato/registrador — classe "Data
-/// Processing (Register)") NUNCA foram implementados em nenhuma sub-task do épico B6.3
+/// **Sessão 2026-08-18 (primeira tentativa de boot real)**: achou o gap `CCMP`/`CCMN`
+/// (Conditional Compare) na PRIMEIRA instrução do `kernel8.img` (`ccmp x18, #0x0, #0xd, pl`,
+/// offset `0x0`, truque de polyglot EFI "MZ" — ver `arch/arm64/kernel/head.S`). Documentado como
+/// gap de feature (não bug) e devolvido ao usuário; fechado por uma sub-task separada no
+/// `arm-jitter` (`B6.8`, 2026-08-20, `CCMP`/`CCMN` decodificados e executados no interpretador).
+///
+/// **Sessão 2026-08-20 (retomada após B6.8) — SEGUNDO bloqueio real, ainda NÃO fechado**: com
+/// `CCMP`/`CCMN` disponíveis, o boot avança de fato (a primeira instrução já não lança) até o
+/// endereço `0x13ba9e8`, onde encontra `0xaa0003f5` — `ORR X21, XZR, X0` (`LSL #0`), ou seja, o
+/// alias `MOV X21, X0` da classe **"Logical (shifted register)"**. Essa classe (que cobre
+/// `AND`/`ORR`/`EOR`/`ANDS`/`BIC`/`ORN`/`EON`/`BICS` com operando registrador — INCLUINDO o alias
+/// `MOV` de registrador, uma das instruções A64 mais comuns que existem) está, segundo o
+/// comentário explícito em `Aarch64Decoder#decodeDataProcessingRegister`
+/// (`arm-jitter/core/.../decoder64/Aarch64Decoder.java`, linha ~942): "`Logical (shifted
+/// register)`: fora do escopo fechado do épico (ver a task B6.3.1)" — ou seja, um gap de feature
+/// CONHECIDO e documentado desde B6.3.1, nunca coberto por nenhuma sub-task de B6 até agora
 /// (B6.3.1-B6.3.4 cobriram ALU shifted/extended register, `CSEL`/aliases, bitfield, mul/div,
-/// exclusive access — `CCMP`/`CCMN` não estavam na lista). A ARM engenharia deliberadamente o
-/// `code0` de um `Image` com EFI stub para começar com os bytes `"MZ"` (assinatura DOS/PE, para o
-/// binário também ser um executável EFI válido) — `ccmp x18, #0x0, #0xd, pl` foi a instrução real
-/// escolhida pelos mantenedores do kernel para satisfazer as duas restrições ao mesmo tempo
-/// (`arch/arm64/kernel/head.S`/`Documentation/arch/arm64/booting.rst` — não é um acidente deste
-/// `kernel8.img` específico, é o mecanismo do EFI stub para TODO kernel arm64 com essa opção
-/// habilitada, então praticamente qualquer kernel real distribuído vai bater nesta MESMA
-/// instrução como primeira). **Decisão desta sessão**: implementar `CCMP`/`CCMN` no `arm-jitter`
-/// está FORA do "Inclui"/"Não inclui" desta task (`f11-raspi3-aarch64-machine.md`: "Sem mudança
-/// no `arm-jitter`. Exceção: bug real da lib" — isto não é um bug, é uma lacuna de feature
-/// legítima, categoria diferente das correções inline que a F3 fez para bugs REAIS de
-/// comportamento incorreto do CP15/DFSR) — precisa de uma sub-task própria no `arm-jitter`
-/// (mesmo rigor de corpus real do resto do épico B6.3, decisão para o usuário priorizar).
-/// {@link #reachesEarlyconBannerInterpreted}/{@link #reachesEarlyconBannerJit}/
-/// {@link #reachesFreeingKernelMemoryInterpreted} ficam `@Disabled` até essa sub-task fechar.
+/// exclusive access; B6.8 cobriu só `CCMP`/`CCMN`). **Decisão desta sessão**: mesma categoria da
+/// sessão anterior — não é um bug (a lib nunca prometeu essa classe), é uma lacuna de feature
+/// fora do "Inclui"/"Não inclui" desta task ("Sem mudança no `arm-jitter`. Exceção: bug real da
+/// lib") — precisa de uma sub-task própria no `arm-jitter` (mesmo rigor de corpus real do resto
+/// do épico B6.3/B6.8), decisão para o usuário priorizar. Dado que `MOV` de registrador é
+/// onipresente em qualquer prólogo/epílogo de função A64 real, é provável que este seja o
+/// PRÓXIMO obstáculo dominante para qualquer kernel real (não uma curiosidade isolada como
+/// `CCMP` no polyglot EFI). {@link #reachesEarlyconBannerInterpreted}/
+/// {@link #reachesEarlyconBannerJit}/{@link #reachesFreeingKernelMemoryInterpreted} continuam
+/// `@Disabled` até essa nova sub-task fechar.
 class Raspi364BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi3-64");
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
     private static final String EARLYCON_BANNER = "Booting Linux on physical CPU";
     private static final String FREEING_KERNEL_MEMORY = "Freeing unused kernel";
-    private static final String CCMP_NOT_IMPLEMENTED_MESSAGE =
-            "AArch64: encoding fora da fatia B6.1 em 0x0: 0xfa405a4d";
+    /// Segundo bloqueio real (sessão 2026-08-20, após `CCMP`/`CCMN` fecharem em B6.8): "Logical
+    /// (shifted register)" (`AND`/`ORR`/`EOR`/... com operando registrador, incl. o alias `MOV`
+    /// de registrador) é gap de feature documentado desde B6.3.1, nunca implementado. Ver
+    /// Javadoc da classe.
+    private static final String LOGICAL_SHIFTED_REGISTER_NOT_IMPLEMENTED_MESSAGE =
+            "AArch64: encoding fora da fatia B6.1 em 0x13ba9e8: 0xaa0003f5";
 
     private static final int MAX_SLICES = 2_000_000;
     private static final int CONSOLE_POLL_INTERVAL = 200;
@@ -70,36 +75,39 @@ class Raspi364BootTest {
         assertTrue(machine.core().x(0) > 0, "X0 (endereço do DTB) deve ser não-nulo");
         assertTrue(machine.core().exceptionState().inEl1(), "esta máquina simula entrega em EL1 (D2)");
 
-        // Achado desta sessão (ver Javadoc da classe): a PRIMEIRA instrução real do kernel8.img
-        // (CCMP, parte do truque de polyglot EFI/"MZ") não é decodificada pelo arm-jitter hoje —
-        // gap de feature real, fora do escopo desta task. PINADO aqui como regressão: se uma
-        // sub-task futura implementar CCMP/CCMN, este teste PRECISA ser atualizado (não é mais
-        // "não implementado"), o que é o sinal correto de que o bloqueio abriu.
+        // Achado desta sessão (2026-08-20, ver Javadoc da classe): CCMP/CCMN (B6.8) desbloquearam
+        // a primeira instrução, mas o boot bate agora em "Logical (shifted register)"
+        // (ORR/alias MOV de registrador), um SEGUNDO gap de feature real, também fora do escopo
+        // desta task. PINADO aqui como regressão: se uma sub-task futura implementar essa classe,
+        // este teste PRECISA ser atualizado (não é mais "não implementado"), sinal correto de que
+        // o bloqueio abriu — e é provável que revele um TERCEIRO gap mais à frente.
         UnsupportedOperationException thrown = assertThrows(UnsupportedOperationException.class,
-                machine::runSlice, "esperava o gap de decode conhecido (CCMP) — se isto não lançar "
-                        + "mais, o bloqueio da task F11 abriu, atualizar este teste");
-        assertEquals(CCMP_NOT_IMPLEMENTED_MESSAGE, thrown.getMessage());
+                machine::runSlice, "esperava o gap de decode conhecido (Logical shifted register) "
+                        + "— se isto não lançar mais, o bloqueio da task F11 abriu, atualizar este teste");
+        assertEquals(LOGICAL_SHIFTED_REGISTER_NOT_IMPLEMENTED_MESSAGE, thrown.getMessage());
     }
 
-    @Disabled("F11 (2026-08-18): bloqueado no gap de decode real CCMP/CCMN do arm-jitter (Data "
-            + "Processing Register) — a PRIMEIRA instrução de qualquer kernel8.img real com EFI "
-            + "stub (truque polyglot MZ) usa CCMP. Ver Javadoc da classe para o achado completo. "
-            + "Fora do escopo desta task (não é bug, é feature ausente) — precisa de sub-task "
-            + "própria no arm-jitter.")
+    @Disabled("F11 (2026-08-20): CCMP/CCMN (B6.8) fecharam o primeiro bloqueio, mas o boot agora "
+            + "bate num SEGUNDO gap de decode real do arm-jitter: 'Logical (shifted register)' "
+            + "(AND/ORR/EOR/... incl. o alias MOV de registrador), documentado como fora de escopo "
+            + "desde B6.3.1. Ver Javadoc da classe para o achado completo. Fora do escopo desta "
+            + "task (não é bug, é feature ausente) — precisa de sub-task própria no arm-jitter.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerInterpreted() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.INTERPRETED, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-18): mesmo bloqueio de reachesEarlyconBannerInterpreted (CCMP/CCMN).")
+    @Disabled("F11 (2026-08-20): mesmo bloqueio de reachesEarlyconBannerInterpreted (Logical "
+            + "shifted register, ver Javadoc da classe).")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerJit() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-18): mesmo bloqueio de reachesEarlyconBannerInterpreted (CCMP/CCMN).")
+    @Disabled("F11 (2026-08-20): mesmo bloqueio de reachesEarlyconBannerInterpreted (Logical "
+            + "shifted register, ver Javadoc da classe).")
     @Test
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryInterpreted() throws Exception {
