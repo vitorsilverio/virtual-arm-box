@@ -31,41 +31,54 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// alias `MOV` da classe "Logical (shifted register)"), gap fechado pela sub-task `B6.9` do
 /// arm-jitter (`AND`/`ORR`/`EOR`/`ANDS`/`BIC`/`ORN`/`EON`/`BICS` + aliases `MOV`/`MVN`).
 ///
-/// **Sessão 2026-08-20 (retomada após B6.9, sessão 4) — TERCEIRO bloqueio real, ainda NÃO
-/// fechado**: com "Logical (shifted register)" disponível, o boot avança bem mais longe (de
-/// `0x13ba9e8` para `0x38fc4` — dezenas de milhares de instruções a mais) até encontrar
-/// `0xd53b0023` em `0x38fc4`. Decodificado manualmente campo a campo (`Rt=X3` bits[4:0]=`00011`,
-/// `op2=1` bits[7:5], `CRm=0` bits[11:8], `CRn=0` bits[15:12], `op1=3` bits[18:16], `o0=1`
-/// bit[19] → `op0=3`, `L=1` → leitura): é `MRS X3, CTR_EL0` (Cache Type Register, EL0-acessível),
-/// uma leitura ONIPRESENTE em qualquer boot A64 real (`dcache_line_size`/`icache_line_size` em
-/// `arch/arm64/kernel/head.S`/`cache.S`). Confirmado no código real do arm-jitter, não só por
-/// inspeção de bits: `Aarch64Decoder#decodeSystemRegisterId`
-/// (`arm-jitter/core/.../decoder64/Aarch64Decoder.java`, linha ~1476) só resolve `op0=3` com
-/// `op1=SYSREG_OP1_EL1`(registradores EL1 "gerais") OU `op1=SYSREG_OP1_EL0_TIMER`(=3) restrito a
-/// `CRn=14` (timer genérico, B6.6.7) — `CTR_EL0` tem `op1=3` mas `CRn=0`
-/// (`decodeGenericTimerRegisterId` devolve `null` porque `crn != SYSREG_CRN_TIMER`), então cai no
-/// `unsupported()` genérico. **Decisão desta sessão**: mesma categoria das duas sessões
-/// anteriores — não é bug (a lib nunca prometeu esse registrador), é lacuna de feature fora do
-/// escopo desta task ("Sem mudança no `arm-jitter`. Exceção: bug real da lib") — precisa de nova
-/// sub-task no arm-jitter (candidata a `B6.10`, mesmo rigor de corpus real de B6.8/B6.9) para
-/// estender `decodeSystemRegisterId`/`Aarch64SystemRegisterId` com o grupo "AArch64 Identification
-/// registers, EL0-acessível" (`op0=3,op1=3,CRn=0`) — `CTR_EL0` no mínimo, possivelmente
-/// `DCZID_EL0` (`CRm=0,op2=7`, também comum em `head.S` para `ZVA`) já que é a mesma família de
-/// registrador. {@link #reachesEarlyconBannerInterpreted}/{@link #reachesEarlyconBannerJit}/
-/// {@link #reachesFreeingKernelMemoryInterpreted} continuam `@Disabled` até essa nova sub-task
-/// fechar.
+/// **Sessão 2026-08-20 (retomada após B6.9, sessão 4) — TERCEIRO bloqueio real, FECHADO por
+/// B6.10**: com "Logical (shifted register)" disponível, o boot avança bem mais longe (de
+/// `0x13ba9e8` para `0x38fc4` — dezenas de milhares de instruções a mais) até
+/// `0xd53b0023` = `MRS X3, CTR_EL0` (Cache Type Register), gap fechado pela sub-task `B6.10` do
+/// arm-jitter (`CTR_EL0`/`DCZID_EL0` no mesmo grupo `op0=3,op1=3,CRn=0` do timer genérico).
+///
+/// **Sessão 2026-08-20 (retomada após B6.10, sessão 5) — QUARTO bloqueio real, FECHADO por
+/// B6.11**: com `CTR_EL0` disponível, o boot avança de `0x38fc4` para `0x38fd4` até
+/// `0x9ac32042` = `LSL X2, X2, X3` (alias de `LSLV`, "Data-processing (2 source)", quantidade de
+/// deslocamento tomada de `Rm` EM TEMPO DE EXECUÇÃO, não um imediato do encoding — família
+/// `LSLV`/`LSRV`/`ASRV`/`RORV`, usada por `dcache_line_size()`/`icache_line_size()` para converter
+/// o campo `CTR_EL0.{I,D}minLine` num tamanho de linha em bytes). Confirmado via
+/// `aarch64-none-elf-as`/`objdump` (G1, oráculo real) ANTES de codificar. Gap fechado pela
+/// sub-task `B6.11` do arm-jitter (`Ir64Op.ShiftVariable`, reaproveita `Ir64LogicalShiftType` de
+/// B6.9).
+///
+/// **Sessão 2026-08-20 (retomada após B6.11, sessão 5, MESMA sessão) — QUINTO bloqueio real,
+/// ainda NÃO fechado**: com `LSLV`/`LSRV`/`ASRV`/`RORV` disponíveis, o boot avança de `0x38fd4`
+/// para `0x39000` até `0xd5087620`, confirmado via `aarch64-none-elf-as`/`objdump` (G1) como
+/// `DC IVAC, X0` (Data Cache line Invalidate by VA to PoC) — instrução da classe **"System
+/// instructions"** (`ARM DDI 0487 C5.2.9`/`C6.2.`, `op0=1` no encoding de `SYS`/`SYSL` genérico,
+/// campos `op1`/`CRn`/`CRm`/`op2` selecionando a operação real: aqui `op1=0,CRn=7,CRm=6,op2=1`).
+/// **Diferente das lacunas anteriores** (uma instrução isolada): esta é uma FAMÍLIA inteira nova
+/// no decoder (`Aarch64Decoder` hoje só resolve `MRS`/`MSR` de registrador nomeado via
+/// `decodeSystemRegisterId`, nunca viu `op0=1` — `DC`/`IC`/`AT`/`TLBI` são todos variantes do
+/// MESMO encoding genérico `SYS`, distinguidos só por `CRn`/`CRm`/`op1`/`op2`), e `DC IVAC` é só
+/// a PRIMEIRA que este boot bate — cache maintenance é onipresente em `head.S`/`cache.S`
+/// (esperado: pelo menos `DC CVAC`/`DC CIVAC`/`DC ZVA`/`IC IVAU`/`IC IALLU` também apareçam mais à
+/// frente, antes de alcançar TLBI, que exige EL1 e semântica de TLB que este projeto talvez nem
+/// precise modelar de verdade — MMU/TLB do `arm-jitter` já são "sempre coerentes" por construção,
+/// então `DC`/`IC`/`TLBI` provavelmente podem virar NO-OP aceito, não uma reimplementação de
+/// cache real; CONFERIR com o usuário/task antes de presumir). **Fora do escopo desta task** (não
+/// é bug, é família de feature nova) — candidata a sub-task própria no arm-jitter (`B6.12`?),
+/// dimensionada para cobrir a família toda de uma vez (não uma instrução por sessão como as
+/// anteriores), dado o padrão já visto aqui. {@link #reachesEarlyconBannerInterpreted}/
+/// {@link #reachesEarlyconBannerJit}/{@link #reachesFreeingKernelMemoryInterpreted} continuam
+/// `@Disabled` até essa nova sub-task fechar.
 class Raspi364BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi3-64");
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
     private static final String EARLYCON_BANNER = "Booting Linux on physical CPU";
     private static final String FREEING_KERNEL_MEMORY = "Freeing unused kernel";
-    /// Terceiro bloqueio real (sessão 2026-08-20, sessão 4, após "Logical shifted register"
-    /// fechar em B6.9): `MRS X3, CTR_EL0` (Cache Type Register) é gap de feature real — o
-    /// decoder só resolve `op0=3,op1=3` para o subconjunto do timer genérico (`CRn=14`, B6.6.7),
-    /// não para o grupo de identificação EL0 (`CRn=0`) ao qual `CTR_EL0` pertence. Ver Javadoc
-    /// da classe.
-    private static final String CTR_EL0_NOT_IMPLEMENTED_MESSAGE =
-            "AArch64: encoding fora da fatia B6.1 em 0x38fc4: 0xd53b0023";
+    /// Quinto bloqueio real (sessão 2026-08-20, sessão 5, após B6.11 fechar LSLV/LSRV/ASRV/RORV):
+    /// `DC IVAC, X0` é a primeira instrução da família "System instructions" (`SYS`/`SYSL`
+    /// genérico, `op0=1`) que este boot encontra — gap de FAMÍLIA nova, não de uma instrução só.
+    /// Ver Javadoc da classe.
+    private static final String SYS_INSTRUCTION_NOT_IMPLEMENTED_MESSAGE =
+            "AArch64: encoding fora da fatia B6.1 em 0x39000: 0xd5087620";
 
     private static final int MAX_SLICES = 2_000_000;
     private static final int CONSOLE_POLL_INTERVAL = 200;
@@ -83,41 +96,43 @@ class Raspi364BootTest {
         assertTrue(machine.core().x(0) > 0, "X0 (endereço do DTB) deve ser não-nulo");
         assertTrue(machine.core().exceptionState().inEl1(), "esta máquina simula entrega em EL1 (D2)");
 
-        // Achado desta sessão (2026-08-20, sessão 4, ver Javadoc da classe): B6.9 (Logical
-        // shifted register) desbloqueou o SEGUNDO gap, o boot avança bem mais longe e bate agora
-        // em `MRS X3, CTR_EL0`, um TERCEIRO gap de feature real, também fora do escopo desta
-        // task. PINADO aqui como regressão: se uma sub-task futura estender
-        // `Aarch64SystemRegisterId` para cobrir CTR_EL0 (candidata a B6.10), este teste PRECISA
-        // ser atualizado (não é mais "não implementado"), sinal correto de que o bloqueio abriu —
-        // e é provável que revele um QUARTO gap mais à frente.
+        // Achado desta sessão (2026-08-20, sessão 5, ver Javadoc da classe): B6.11 (LSLV/LSRV/
+        // ASRV/RORV) desbloqueou o QUARTO gap, o boot avança mais longe e bate agora em
+        // `DC IVAC, X0`, um QUINTO gap real — mas desta vez uma FAMÍLIA inteira nova ("System
+        // instructions", SYS/SYSL genérico), não uma instrução isolada. PINADO aqui como
+        // regressão: se uma sub-task futura estender o decoder para cobrir SYS/DC (candidata a
+        // B6.12), este teste PRECISA ser atualizado (não é mais "não implementado"), sinal
+        // correto de que o bloqueio abriu — e é provável que revele mais variantes da mesma
+        // família mais à frente (DC CVAC/CIVAC/ZVA, IC IVAU/IALLU, eventualmente TLBI).
         UnsupportedOperationException thrown = assertThrows(UnsupportedOperationException.class,
-                machine::runSlice, "esperava o gap de decode conhecido (MRS CTR_EL0) "
+                machine::runSlice, "esperava o gap de decode conhecido (DC IVAC) "
                         + "— se isto não lançar mais, o bloqueio da task F11 abriu, atualizar este teste");
-        assertEquals(CTR_EL0_NOT_IMPLEMENTED_MESSAGE, thrown.getMessage());
+        assertEquals(SYS_INSTRUCTION_NOT_IMPLEMENTED_MESSAGE, thrown.getMessage());
     }
 
-    @Disabled("F11 (2026-08-20, sessão 4): B6.9 (Logical shifted register) fechou o SEGUNDO "
-            + "bloqueio, mas o boot agora bate num TERCEIRO gap de decode real do arm-jitter: "
-            + "'MRS X3, CTR_EL0' (Cache Type Register, EL0-acessível), fora do subconjunto de "
-            + "registradores de sistema resolvido por Aarch64Decoder#decodeSystemRegisterId. Ver "
-            + "Javadoc da classe para o achado completo. Fora do escopo desta task (não é bug, é "
-            + "feature ausente) — precisa de sub-task própria no arm-jitter (candidata a B6.10).")
+    @Disabled("F11 (2026-08-20, sessão 5): B6.11 (LSLV/LSRV/ASRV/RORV) fechou o QUARTO "
+            + "bloqueio, mas o boot agora bate numa FAMÍLIA inteira nova de decode: 'DC IVAC, X0' "
+            + "(System instructions, SYS/SYSL genérico op0=1), fora do subconjunto de "
+            + "registradores de sistema nomeado resolvido por Aarch64Decoder#decodeSystemRegisterId. "
+            + "Ver Javadoc da classe para o achado completo. Fora do escopo desta task (não é bug, é "
+            + "família de feature ausente) — precisa de sub-task própria no arm-jitter (candidata a "
+            + "B6.12), dimensionada para a família toda (DC/IC/AT/TLBI), não uma instrução por vez.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerInterpreted() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.INTERPRETED, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-20, sessão 4): mesmo bloqueio de reachesEarlyconBannerInterpreted "
-            + "(MRS CTR_EL0, ver Javadoc da classe).")
+    @Disabled("F11 (2026-08-20, sessão 5): mesmo bloqueio de reachesEarlyconBannerInterpreted "
+            + "(DC IVAC, ver Javadoc da classe).")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerJit() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-20, sessão 4): mesmo bloqueio de reachesEarlyconBannerInterpreted "
-            + "(MRS CTR_EL0, ver Javadoc da classe).")
+    @Disabled("F11 (2026-08-20, sessão 5): mesmo bloqueio de reachesEarlyconBannerInterpreted "
+            + "(DC IVAC, ver Javadoc da classe).")
     @Test
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryInterpreted() throws Exception {
