@@ -105,9 +105,40 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// (segunda tabela-base + lógica de seleção por VA alto/baixo, provavelmente via `TCR_EL1.T1SZ`)
 /// + na ponte de registrador de sistema (`Aarch64VmsaSystemRegisters`, `B6.6.3`). Confirmar a
 /// hipótese com instrumentação ANTES de implementar (mesma disciplina de todas as sub-tasks
-/// anteriores desta fila) — pode haver outra causa. {@link #reachesEarlyconBannerInterpreted}/
+/// anteriores desta fila) — pode haver outra causa.
+///
+/// **Sessão 2026-08-24 (retomada após B6.9/B6.13/B6.14 fecharem, todos ✅ desde então) — QUATRO
+/// bloqueios reais novos achados e fechados na mesma sessão**: (1) `CPACR_EL1`
+/// (`op0=3,op1=0,CRn=1,CRm=0,op2=2`, escrito logo após `SCTLR_EL1` em `head.S`) — nunca
+/// decodificado; (2) o grupo inteiro de identidade `ID_AA64*` restante (`CRn=0,CRm=4-7`:
+/// `ID_AA64PFR1_EL1`/`ID_AA64ZFR0_EL1`/`ID_AA64DFR1_EL1`/`ID_AA64ISAR1_EL1`/`ID_AA64ISAR2_EL1`/
+/// `ID_AA64MMFR1_EL1`-`ID_AA64MMFR4_EL1`/`REVIDR_EL1`) — sondado em sequência por
+/// `head.S`/`cpufeature.c`; resolvido de uma vez (não gap-a-gap) para não pagar um boot inteiro
+/// por registrador; (3) **`TTBR1_EL1` de verdade** (não só decodificado — a hipótese refutada de
+/// `B6.13` estava certa sobre a MECÂNICA, só errada sobre a causa do sétimo bloqueio antigo:
+/// `TranslatingAddressSpace64` ganhou `setTtbr1`/segunda tabela-base, `walk()` seleciona por
+/// `VA[55]` — bit 55, não bit 63, mesmo fato já registrado por B6.13 contra `aa64_va_parameters`
+/// real do QEMU). Todos os 3 conferidos via `aarch64-none-elf-as`/`objdump` reais (devkitA64
+/// disponível nesta sessão) antes de codificar — G1.
+///
+/// Com os 3 fechados, **o backend INTERPRETED roda 10 minutos inteiros sem lançar exceção
+/// nenhuma** (nem decode gap, nem fault de tradução) — não há mais nenhum bloqueio "duro"
+/// conhecido, mas também não alcança `EARLYCON_BANNER` dentro do orçamento (`MAX_SLICES` nem é
+/// esgotado: o `@Timeout` de 10 minutos interrompe o laço no meio). Ou o boot é genuinamente mais
+/// lento agora (mais registradores de sistema resolvidos → mais page-walks reais via `TTBR1_EL1`
+/// sem essa via passar pela micro-TLB tão bem quanto `TTBR0`?) ou há um laço ocioso real (mesmo
+/// padrão já visto na investigação de silêncio da F3, 2026-08-16) — **não isolado nesta sessão**
+/// (disciplina de custo: 10-15min de orçamento para INTERPRETED, já consumido). O backend **JIT**
+/// foi tentado como alternativa mais barata e diverge muito mais cedo, com uma falha DIFERENTE
+/// (`MemoryTranslationException64: TRANSLATION_FAULT_L3 em 0x200`, ~1s) — não teve nenhuma
+/// investigação nesta sessão (pode ser um bug real do caminho JIT nunca exercitado por um boot A64
+/// tão profundo, ou uma diferença de estado entre os dois backends nesta máquina). **Candidata a
+/// sessão dedicada**: (a) instrumentar por que o INTERPRETED não avança mais rápido/não alcança o
+/// marco (profiling de onde o tempo vai — quantos slices/s, se há um `WFI`/loop-e-volta), (b)
+/// investigar a divergência do JIT separadamente (endereço `0x200` bem baixo sugere um problema
+/// diferente, talvez anterior aos 3 gaps fechados aqui). {@link #reachesEarlyconBannerInterpreted}/
 /// {@link #reachesEarlyconBannerJit}/{@link #reachesFreeingKernelMemoryInterpreted} continuam
-/// `@Disabled` até essa nova sub-task fechar.
+/// `@Disabled` até uma dessas frentes fechar.
 class Raspi364BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi3-64");
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
@@ -135,26 +166,25 @@ class Raspi364BootTest {
         machine.runSlice();
     }
 
-    @Disabled("F11 (2026-08-20, sessão 6): SÉTIMO bloqueio real, ainda NÃO fechado — PA "
-            + "traduzido além dos 4 GiB (0x100000882) num write64 dentro de load-store-pair, com "
-            + "TTBR1_EL1 nunca modelado (só TTBR0 liga de verdade, achado real desde B6.6.3). "
-            + "Ver Javadoc da classe.")
+    @Disabled("F11 (2026-08-24, sessão 7): sem bloqueio duro conhecido (10min de INTERPRETED "
+            + "correm sem exceção), mas não alcança o marco no orçamento — causa (lentidão real "
+            + "vs. laço ocioso) não isolada nesta sessão. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerInterpreted() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.INTERPRETED, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-20, sessão 5): mesmo bloqueio de reachesEarlyconBannerInterpreted "
-            + "(DC IVAC, ver Javadoc da classe).")
+    @Disabled("F11 (2026-08-24, sessão 7): JIT diverge cedo com falha DIFERENTE do INTERPRETED "
+            + "(TRANSLATION_FAULT_L3 em 0x200) — não investigado nesta sessão. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerJit() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-20, sessão 5): mesmo bloqueio de reachesEarlyconBannerInterpreted "
-            + "(DC IVAC, ver Javadoc da classe).")
+    @Disabled("F11 (2026-08-24, sessão 7): mesmo bloqueio de reachesEarlyconBannerInterpreted "
+            + "(marco anterior a este nunca fechou nesta sessão). Ver Javadoc da classe.")
     @Test
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
     void reachesFreeingKernelMemoryInterpreted() throws Exception {
