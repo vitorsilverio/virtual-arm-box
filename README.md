@@ -42,6 +42,16 @@ o boot é acorrentado ao hardware da Apple). Ver `ROADMAP.md`.
 (binários reais, reprodutibilidade documentada — sem toolchain `arm-linux-*` disponível nesta
 máquina para compilar da fonte, ver a seção "Blocked" lá).
 
+## Como contribuir
+
+Issues e pull requests são bem-vindos — ver [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Autor e contato
+
+Feito por [Vitor Silvério Rodrigues](https://vitorsilverio.dev/) — blog/currículo com mais
+detalhes sobre este e outros projetos. Contato: vitor.silverio.rodrigues@gmail.com ou uma
+[issue](https://github.com/vitorsilverio/virtual-arm-box/issues) neste repositório.
+
 ## Licença
 
 BSD 3-Clause — ver [LICENSE](LICENSE).
