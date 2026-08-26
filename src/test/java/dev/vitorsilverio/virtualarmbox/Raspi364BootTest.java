@@ -139,6 +139,34 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// diferente, talvez anterior aos 3 gaps fechados aqui). {@link #reachesEarlyconBannerInterpreted}/
 /// {@link #reachesEarlyconBannerJit}/{@link #reachesFreeingKernelMemoryInterpreted} continuam
 /// `@Disabled` até uma dessas frentes fechar.
+///
+/// **Sessão 8 (2026-08-26) — frente (b) da sessão 7 fechada: causa raiz REAL da divergência JIT
+/// achada e corrigida no `arm-jitter` (2 bugs, não 1)**. `TRANSLATION_FAULT_L3 em 0x200
+/// (DATA_READ)` não vinha de um bloco JÁ compilado executando errado — vinha do PRÓPRIO `lift()`
+/// tentando decidir onde um bloco QUENTE termina: `StandardIr64BlockLifter` decodifica instruções
+/// À FRENTE do PC atual (até `maxBlockInstructions`, sem nenhum desvio ainda visto) só para
+/// delimitar o bloco, e esse lookahead cruzou para uma página de código sem descritor de página
+/// válido — memória que a execução real talvez NUNCA alcance (um desvio pode ocorrer antes).
+/// `JitRuntime64#execute` nunca cercava esse `lift()` com um `try/catch` de
+/// `MemoryTranslationException64` — o precedente 32-bit (`JitRuntime#LIFT_FAULT_CYCLES`) já tinha
+/// essa proteção desde a task `B4.1.5`, nunca foi portado para o mundo A64. Corrigido espelhando o
+/// mesmo padrão (`JitRuntime64#LIFT_FAULT_CYCLES`, novo). **Achado 2, encontrado ANTES deste
+/// (mesma sessão) por uma hipótese diferente que acabou não sendo a causa deste sintoma
+/// específico, mas era um bug real e mais grave**: `Ir64BlockCompiler` (o compilador de bytecode
+/// nativo A64) nunca cercava o bloco compilado com NENHUM `try/catch` — ao contrário do precedente
+/// 32-bit (`AsmBlockCompiler`, desde `B4.1.3`), QUALQUER falta de tradução (ou `BRK`/instrução
+/// indefinida/`HVC`/`SMC`) no MEIO da execução de um bloco A64 já promovido a nativo escapava como
+/// exceção do HOST em vez de entrar no handler do guest — bug latente em TODO bloco A64 quente,
+/// não só neste boot. Corrigido com os mesmos 5 handlers que `Ir64BlockExecutor#executeBlock` já
+/// tinha. Os dois fixes têm testes de regressão dedicados no `arm-jitter`
+/// (`Ir64BlockCompilerMemoryAbortTest`, `JitRuntime64LiftFaultTest`) — confirmados FALHANDO sem o
+/// fix e passando com ele, mesma disciplina de toda task desta fila. **Efeito medido nesta
+/// sessão** (contra um `arm-jitter` local com os 2 fixes, ainda NÃO publicado — ver
+/// {@link #reachesEarlyconBannerJit}): o backend JIT deixa de lançar QUALQUER exceção e roda os
+/// 2.000.000 de fatias completos do orçamento do teste (114s) sem crashar — mas, como o
+/// INTERPRETED, não alcança `EARLYCON_BANNER` dentro do orçamento. **F11 segue 🟡 PARCIAL**: a
+/// frente (b) da sessão 7 fechou (causa raiz achada+corrigida), a frente (a) (lento vs. preso)
+/// continua aberta para ambos os backends agora que convergem no mesmo sintoma.
 class Raspi364BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi3-64");
     private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
@@ -175,8 +203,14 @@ class Raspi364BootTest {
         assertReachesMarker(Raspi364Machine.Backend.INTERPRETED, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-24, sessão 7): JIT diverge cedo com falha DIFERENTE do INTERPRETED "
-            + "(TRANSLATION_FAULT_L3 em 0x200) — não investigado nesta sessão. Ver Javadoc da classe.")
+    @Disabled("F11 (sessão 8, 2026-08-26): a divergência JIT foi CAUSA-RAIZ ACHADA E CORRIGIDA no "
+            + "arm-jitter (2 bugs reais, ver Javadoc da classe) — mas a correção ainda não foi "
+            + "publicada no Maven Central (fica em 1.1.0), então esta versão continua reproduzindo "
+            + "o crash antigo. Reabilitar depois que uma versão nova do arm-jitter for publicada "
+            + "(F5) e este repo migrar para ela (F7) — nessa hora, medido localmente contra o "
+            + "arm-jitter corrigido, o JIT já não lança mais nenhuma exceção e roda os 2.000.000 de "
+            + "fatias completos (mesmo teto do INTERPRETED), mas AINDA NÃO alcança o marco — mesmo "
+            + "bloqueio (lento vs. preso, não isolado) de reachesEarlyconBannerInterpreted.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerJit() throws Exception {
