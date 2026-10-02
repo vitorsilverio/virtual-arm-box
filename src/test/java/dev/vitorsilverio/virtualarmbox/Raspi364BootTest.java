@@ -1,6 +1,5 @@
 package dev.vitorsilverio.virtualarmbox;
 
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -167,12 +166,39 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// INTERPRETED, não alcança `EARLYCON_BANNER` dentro do orçamento. **F11 segue 🟡 PARCIAL**: a
 /// frente (b) da sessão 7 fechou (causa raiz achada+corrigida), a frente (a) (lento vs. preso)
 /// continua aberta para ambos os backends agora que convergem no mesmo sintoma.
+/// **Sessão 9 (2026-10-01) — BOOT COMPLETO ATÉ O ROOT-MOUNT no INTERPRETED (~85s)**. Cinco causas
+/// reais achadas e fechadas em sequência (3 no `arm-jitter`, 2 aqui): (1) o `TranslatingAddressSpace64`
+/// ignorava `TCR_EL1.T0SZ/T1SZ` e sempre começava o walk em L0 — o kernel do Pi usa VA de 39 bits
+/// (walk começa em L1), então o primeiro acesso a um VA do kernel dava falta de tradução nível 0
+/// (a "causa" do laço em `0x200` das sessões 7/8); (2) `SP_EL0`, `CLIDR_EL1`/`CCSIDR_EL1`/
+/// `CSSELR_EL1`/`AIDR_EL1`, `CNTKCTL_EL1` e o espaço de ID reservado (RAZ, ex. `ID_AA64ISAR3_EL1`)
+/// não existiam; (3) bug de decode: `ldr x0, [x0, #31624]` virava `LDRAA/LDRAB` (a guarda não olhava a
+/// forma "unsigned offset"); (4) aqui: o cmdline `earlycon` sem argumento seguia o `stdout-path` do
+/// DTB até o mini-UART AUX (8250, não modelado) e o guest girava em `wait_for_xmitr`; (5) aqui: o
+/// Linux em EL1 usa o timer VIRTUAL (`CNTV_*`/`CNTVCT_EL0`, PPI `nCNTVIRQ`), não só o físico.
+/// O boot termina em `VFS: Unable to mount root fs` — esperado, o initramfs deste teste é sintético.
+/// **Sessão 10 (2026-10-02) — JIT A64 IGUALA O INTERPRETADO até o root-mount.** O JIT travava em
+/// `Mountpoint-cache hash table` onde o interpretado seguia. Isolado por lockstep (um bloco do JIT x o
+/// mesmo número de instruções interpretadas, comparando PC/X0-X30/SP), com 3 causas reais no
+/// `arm-jitter`: (1) `JitRuntime64#execute` nunca servia IRQ para blocos já compilados (só o caminho
+/// frio); (2) o lifter não terminava o bloco depois de `ERET`/`HVC`/`SMC`/`BRK`/`HLT`/`WFI` — o bloco
+/// de `kernel_exit` do Linux seguia executando o resto DEPOIS do `eret`, clobberando `x0`/`x19`;
+/// (3) sem invalidação de código auto-modificável: o kernel troca `b`↔`nop` (jump labels) e publica
+/// com `IC IVAU`/`IC IALLU`, que eram NOP — agora derrubam os blocos compilados por página física.
+/// **Desempenho**: o JIT chega ao panic em ~115s contra ~85s do interpretado, isto é, ainda MAIS LENTO
+/// (sem inline cache nem encadeamento de blocos, uma alocação de `BlockKey64`+`HashMap` por bloco).
 class Raspi364BootTest {
     private static final Path TESTDATA = Path.of("testdata", "raspi3-64");
-    private static final String CMDLINE = "console=ttyAMA0,115200 earlycon root=/dev/ram rdinit=/init";
+    /// `earlycon` com endereço explícito do PL011: sem argumentos o kernel usa o `stdout-path` do DTB,
+    /// que no Pi 3 aponta para o mini-UART AUX (8250, `0x3F215040`) — não modelado, o guest ficava
+    /// preso em `wait_for_xmitr` lendo o LSR (sessão 9, 2026-10-01).
+    private static final String CMDLINE =
+            "earlycon=pl011,mmio32,0x3f201000 console=ttyAMA0,115200 root=/dev/ram rdinit=/init";
     private static final String EARLYCON_BANNER = "Booting Linux on physical CPU";
-    private static final String FREEING_KERNEL_MEMORY = "Freeing unused kernel";
-    private static final int MAX_SLICES = 2_000_000;
+    /// Com o initramfs sintético (vazio), o boot termina aqui: todos os subsistemas + drivers + o
+    /// `populate_rootfs` rodaram, só falta um `/init` de verdade.
+    private static final String ROOT_MOUNT_STAGE = "No filesystem could mount root";
+    private static final int MAX_SLICES = 4_000_000;
     private static final int CONSOLE_POLL_INTERVAL = 200;
 
     @Test
@@ -194,35 +220,28 @@ class Raspi364BootTest {
         machine.runSlice();
     }
 
-    @Disabled("F11 (2026-08-24, sessão 7): sem bloqueio duro conhecido (10min de INTERPRETED "
-            + "correm sem exceção), mas não alcança o marco no orçamento — causa (lentidão real "
-            + "vs. laço ocioso) não isolada nesta sessão. Ver Javadoc da classe.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerInterpreted() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.INTERPRETED, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (sessão 8, 2026-08-26): a divergência JIT foi CAUSA-RAIZ ACHADA E CORRIGIDA no "
-            + "arm-jitter (2 bugs reais, ver Javadoc da classe) — mas a correção ainda não foi "
-            + "publicada no Maven Central (fica em 1.1.0), então esta versão continua reproduzindo "
-            + "o crash antigo. Reabilitar depois que uma versão nova do arm-jitter for publicada "
-            + "(F5) e este repo migrar para ela (F7) — nessa hora, medido localmente contra o "
-            + "arm-jitter corrigido, o JIT já não lança mais nenhuma exceção e roda os 2.000.000 de "
-            + "fatias completos (mesmo teto do INTERPRETED), mas AINDA NÃO alcança o marco — mesmo "
-            + "bloqueio (lento vs. preso, não isolado) de reachesEarlyconBannerInterpreted.")
     @Test
     @Timeout(value = 10, unit = TimeUnit.MINUTES)
     void reachesEarlyconBannerJit() throws Exception {
         assertReachesMarker(Raspi364Machine.Backend.JIT, EARLYCON_BANNER);
     }
 
-    @Disabled("F11 (2026-08-24, sessão 7): mesmo bloqueio de reachesEarlyconBannerInterpreted "
-            + "(marco anterior a este nunca fechou nesta sessão). Ver Javadoc da classe.")
     @Test
-    @Timeout(value = 15, unit = TimeUnit.MINUTES)
-    void reachesFreeingKernelMemoryInterpreted() throws Exception {
-        assertReachesMarker(Raspi364Machine.Backend.INTERPRETED, FREEING_KERNEL_MEMORY);
+    @Timeout(value = 6, unit = TimeUnit.MINUTES)
+    void reachesRootMountStageInterpreted() throws Exception {
+        assertReachesMarker(Raspi364Machine.Backend.INTERPRETED, ROOT_MOUNT_STAGE);
+    }
+
+    @Test
+    @Timeout(value = 8, unit = TimeUnit.MINUTES)
+    void reachesRootMountStageJit() throws Exception {
+        assertReachesMarker(Raspi364Machine.Backend.JIT, ROOT_MOUNT_STAGE);
     }
 
     private static void assertReachesMarker(Raspi364Machine.Backend backend, String marker) throws Exception {

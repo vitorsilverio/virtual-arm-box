@@ -30,10 +30,11 @@ public final class Bcm2836LocalIntc implements AddressSpace {
 
     /// `nCNTPNSIRQ` (timer físico não-seguro) — bit `1` de `Core0 Timer Interrupt Control`/
     /// `Core0 IRQ Source` (`QA7_rev3.4.pdf` tabela "Timer & Mailbox Interrupt control"). É a
-    /// ÚNICA fonte de timer habilitada por `arch_timer_starting_cpu` num boot EL1 sem
-    /// hipervisor — `nCNTPSIRQ`(bit0)/`nCNTHPIRQ`(bit2)/`nCNTVIRQ`(bit3) ficam fora (sem
-    /// consumidor, mesma disciplina de {@link Bcm2836GenericTimer}).
+    /// Fonte do comparador físico; `nCNTPSIRQ`(bit0)/`nCNTHPIRQ`(bit2) ficam fora (seguro/hyp,
+    /// sem consumidor num boot EL1).
     private static final int TIMER_CONTROL_CNTPNSIRQ_BIT = 1 << 1;
+    /// `nCNTVIRQ` (timer virtual) — bit `3`, a fonte que o Linux em EL1 habilita de fato.
+    private static final int TIMER_CONTROL_CNTVIRQ_BIT = 1 << 3;
     /// Bit `8` de `Core0 IRQ Source` — passthrough da linha `nIRQ` combinada do `Bcm2835Ic`
     /// legado (`QA7_rev3.4.pdf`: "GPU IRQ", sempre roteada ao core 0 nesta task).
     private static final int SOURCE_GPU_IRQ_BIT = 1 << 8;
@@ -59,8 +60,20 @@ public final class Bcm2836LocalIntc implements AddressSpace {
     }
 
     private boolean timerIrqAsserted() {
-        return (timerIrqControl & TIMER_CONTROL_CNTPNSIRQ_BIT) != 0
-                && genericTimer.physicalTimerIrqPending();
+        return timerSourceBits() != 0;
+    }
+
+    /// Bits de `Core0 IRQ Source` vindos dos timers: pendente E habilitado em
+    /// `Core0 Timer Interrupt Control`.
+    private int timerSourceBits() {
+        int bits = 0;
+        if ((timerIrqControl & TIMER_CONTROL_CNTPNSIRQ_BIT) != 0 && genericTimer.physicalTimerIrqPending()) {
+            bits |= TIMER_CONTROL_CNTPNSIRQ_BIT;
+        }
+        if ((timerIrqControl & TIMER_CONTROL_CNTVIRQ_BIT) != 0 && genericTimer.virtualTimerIrqPending()) {
+            bits |= TIMER_CONTROL_CNTVIRQ_BIT;
+        }
+        return bits;
     }
 
     @Override
@@ -78,7 +91,7 @@ public final class Bcm2836LocalIntc implements AddressSpace {
         int offset = address & (REGION_SIZE - 1);
         return switch (offset) {
             case REG_CORE0_TIMER_IRQ_CONTROL -> timerIrqControl;
-            case REG_CORE0_IRQ_SOURCE -> (timerIrqAsserted() ? TIMER_CONTROL_CNTPNSIRQ_BIT : 0)
+            case REG_CORE0_IRQ_SOURCE -> timerSourceBits()
                     | (legacyIcIrqLine ? SOURCE_GPU_IRQ_BIT : 0);
             default -> 0;
         };
