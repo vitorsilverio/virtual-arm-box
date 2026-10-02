@@ -42,7 +42,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /// `LSLV`/`LSRV`/`ASRV`/`RORV`, usada por `dcache_line_size()`/`icache_line_size()` para converter
 /// o campo `CTR_EL0.{I,D}minLine` num tamanho de linha em bytes). Confirmado via
 /// `aarch64-none-elf-as`/`objdump` (G1, oráculo real) ANTES de codificar. Gap fechado pela
-/// sub-task `B6.11` do arm-jitter (`Ir64Op.ShiftVariable`, reaproveita `Ir64LogicalShiftType` de
+/// sub-task `B6.11` do arm-jitter (`IntegerOp64.ShiftVariable`, reaproveita `Ir64LogicalShiftType` de
 /// B6.9).
 ///
 /// **Sessão 2026-08-20 (retomada após B6.11, sessão 5, MESMA sessão) — QUINTO bloqueio real,
